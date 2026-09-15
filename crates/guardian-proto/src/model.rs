@@ -497,7 +497,7 @@ pub struct VcsState {
     pub dirty_files: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResumeCapability {
     /// A resume handle is available and the session can be resumed.
@@ -509,6 +509,9 @@ pub enum ResumeCapability {
     },
     /// The agent supports resume but no handle was found.
     Unsupported,
+    /// Nothing is known about resuming this session. The default, because offering a resume
+    /// the agent cannot honour is worse than offering none.
+    #[default]
     Unavailable,
 }
 
