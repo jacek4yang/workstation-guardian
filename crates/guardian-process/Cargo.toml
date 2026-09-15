@@ -17,3 +17,5 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The real-machine tests use guardian-win directly to enumerate and inspect processes.
+guardian-win.workspace = true
