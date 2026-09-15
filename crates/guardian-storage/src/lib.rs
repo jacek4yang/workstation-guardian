@@ -315,6 +315,7 @@ pub struct Checkpoint {
     pub session_id: String,
     pub mode: String,
     pub update_protection: String,
+    /// The full inventory, which includes both agents and protected workloads.
     pub agents: Box<AgentInventory>,
     pub network: Box<NetworkSnapshot>,
     pub reboot_authorization: Option<RebootAuthorization>,
@@ -524,10 +525,25 @@ impl Journal {
         Ok(out)
     }
 
-    /// Rotate: rename the current file to `.1` and start fresh. Called only when the size
-    /// cap is reached, so this is rare and cheap.
-    fn rotate(&mut self) -> Result<(), StorageError> {
+    /// Rotate: rename the current file to `.1` and start a fresh one.
+    ///
+    /// # Why the session start is re-written
+    ///
+    /// The recovery logic decides whether a session ended cleanly by looking for a
+    /// `SessionStart` record followed by a `CleanShutdown` record *in the same file*. If
+    /// rotation simply moved everything aside, the current session's start marker would be
+    /// gone, and its eventual clean shutdown would be indistinguishable from a crash. That
+    /// would manufacture a false "unexpected restart" incident on every rotation, which is
+    /// exactly the kind of noisy lie that destroys trust in the recovery report.
+    ///
+    /// Re-writing the most recent session's start marker into the fresh file keeps the
+    /// pairing intact across rotation. The cost is a few hundred bytes.
+    pub fn rotate(&mut self) -> Result<(), StorageError> {
         self.file = None;
+
+        // Capture the current session's identity before the file moves away.
+        let carried = self.current_session_start();
+
         let prev = self.path.with_extension("1");
         let _ = fs::remove_file(&prev);
         fs::rename(&self.path, &prev).map_err(|e| StorageError::io(&self.path, e))?;
@@ -539,7 +555,23 @@ impl Journal {
             .map_err(|e| StorageError::io(&self.path, e))?;
         self.file = Some(f);
         self.bytes_written = 0;
+
+        // Re-establish the session identity in the new file.
+        if let Some(record) = carried {
+            self.append(&record, true)?;
+        }
+
         Ok(())
+    }
+
+    /// The most recent `SessionStart` in the current file, if any.
+    fn current_session_start(&self) -> Option<JournalRecord> {
+        let read = Journal::read_all(&self.path).ok()?;
+        read.records
+            .iter()
+            .rev()
+            .find(|r| matches!(r, JournalRecord::SessionStart { .. }))
+            .cloned()
     }
 
     /// Force everything to disk. Called from preshutdown and before an armed reboot.
@@ -952,6 +984,65 @@ mod tests {
         assert!(j.bytes_written() < 64 * 1024, "must have rotated");
         let rotated = p.with_extension("1");
         assert!(rotated.exists(), "rotation keeps exactly one previous file");
+    }
+
+    #[test]
+    fn rotation_preserves_the_current_session_identity() {
+        // Regression: rotation used to move the SessionStart record into the rotated file,
+        // which made a later CleanShutdown in the fresh file appear to belong to no session -
+        // so a clean stop was misreported as a crash after every rotation.
+        let d = TempDir::new("rotate-session");
+        let p = d.path("journal.log");
+        let big = "x".repeat(4096);
+
+        {
+            let mut j = Journal::open(&p, 64 * 1024).unwrap();
+            j.append(
+                &JournalRecord::SessionStart {
+                    boot_id: "boot-1".into(),
+                    session_id: "current".into(),
+                    started_at_ms: 0,
+                    version: "0.1.0".into(),
+                },
+                true,
+            )
+            .unwrap();
+
+            // Force at least one rotation with filler records.
+            for i in 0..40 {
+                j.append(
+                    &JournalRecord::NetworkEvent {
+                        at_ms: i,
+                        detail: format!("{big}{i}"),
+                    },
+                    false,
+                )
+                .unwrap();
+            }
+
+            j.append(
+                &JournalRecord::CleanShutdown {
+                    at_ms: 999,
+                    uptime_ms: 999,
+                },
+                true,
+            )
+            .unwrap();
+        }
+
+        assert!(
+            p.with_extension("1").exists(),
+            "rotation should have happened"
+        );
+        let read = Journal::read_all(&p).unwrap();
+        assert!(
+            read.session_ended_cleanly("current"),
+            "the current session must still be recognized after rotation; records: {:?}",
+            read.records.iter().map(|r| r.tag()).collect::<Vec<_>>()
+        );
+
+        // And an unrelated session id must still not inherit the marker.
+        assert!(!read.session_ended_cleanly("some-other-session"));
     }
 
     #[test]

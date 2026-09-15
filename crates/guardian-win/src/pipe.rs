@@ -395,6 +395,87 @@ pub struct PipeClient {
     handle: HANDLE,
 }
 
+/// Read support so the framing layer above can use ordinary `io` traits.
+///
+/// A pipe read is a plain `ReadFile`, so the mapping is direct. `read` returning 0 means the
+/// peer closed, which is what `io::Read`'s contract expects.
+impl std::io::Read for PipeServer {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u32;
+        // Safety: `buf` is a valid writable slice for `buf.len()` bytes.
+        let ok = unsafe { ReadFile(self.handle, Some(buf), Some(&mut n), None) };
+        if ok.is_err() {
+            return Err(std::io::Error::other(
+                WinError::last("ReadFile").to_string(),
+            ));
+        }
+        Ok(n as usize)
+    }
+}
+
+impl std::io::Write for PipeServer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u32;
+        // Safety: `buf` is a valid readable slice for `buf.len()` bytes.
+        let ok = unsafe { WriteFile(self.handle, Some(buf), Some(&mut n), None) };
+        if ok.is_err() {
+            return Err(std::io::Error::other(
+                WinError::last("WriteFile").to_string(),
+            ));
+        }
+        Ok(n as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Unbuffered writes go straight to the pipe; nothing to flush.
+        Ok(())
+    }
+}
+
+impl std::io::Read for PipeClient {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u32;
+        // Safety: `buf` is a valid writable slice for `buf.len()` bytes.
+        let ok = unsafe { ReadFile(self.handle, Some(buf), Some(&mut n), None) };
+        if ok.is_err() {
+            return Err(std::io::Error::other(
+                WinError::last("ReadFile").to_string(),
+            ));
+        }
+        Ok(n as usize)
+    }
+}
+
+impl std::io::Write for PipeClient {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut n = 0u32;
+        // Safety: `buf` is a valid readable slice for `buf.len()` bytes.
+        let ok = unsafe { WriteFile(self.handle, Some(buf), Some(&mut n), None) };
+        if ok.is_err() {
+            return Err(std::io::Error::other(
+                WinError::last("WriteFile").to_string(),
+            ));
+        }
+        Ok(n as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl PipeClient {
     /// The access rights a client requests.
     ///

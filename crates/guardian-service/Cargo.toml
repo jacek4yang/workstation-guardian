@@ -29,3 +29,6 @@ tracing-appender.workspace = true
 time.workspace = true
 uuid.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+guardian-core = { path = "../guardian-core", features = ["test-fakes"] }

@@ -665,6 +665,17 @@ pub enum InternetHealth {
     Unknown,
 }
 
+impl InternetHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InternetHealth::Healthy => "healthy",
+            InternetHealth::Degraded => "degraded",
+            InternetHealth::Down => "down",
+            InternetHealth::Unknown => "unknown",
+        }
+    }
+}
+
 /// One configured connectivity probe and its last result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeResult {
@@ -991,6 +1002,74 @@ pub struct ServiceHealth {
     pub degraded_components: Vec<String>,
     /// Set when the service is running from a recovery restart after a crash.
     pub started_after_unclean_exit: bool,
+}
+
+impl ServiceHealth {
+    /// Render this health as a set of doctor-style checks.
+    ///
+    /// Kept next to the type so the service and `guardianctl doctor` cannot disagree about
+    /// what "healthy" means.
+    pub fn into_health_report(self) -> HealthReport {
+        let mut checks = vec![
+            HealthCheck {
+                id: "service.running".into(),
+                name: "Service running".into(),
+                ok: self.running,
+                severity: if self.running {
+                    FindingSeverity::Info
+                } else {
+                    FindingSeverity::Error
+                },
+                detail: if self.running {
+                    format!("running for {}s", self.uptime_ms / 1000)
+                } else {
+                    "the service is not running".into()
+                },
+            },
+            HealthCheck {
+                id: "service.components".into(),
+                name: "Subsystems healthy".into(),
+                ok: self.degraded_components.is_empty(),
+                severity: if self.degraded_components.is_empty() {
+                    FindingSeverity::Info
+                } else {
+                    FindingSeverity::Warning
+                },
+                detail: if self.degraded_components.is_empty() {
+                    "every subsystem is running and has reported progress".into()
+                } else {
+                    format!("degraded: {}", self.degraded_components.join(", "))
+                },
+            },
+        ];
+
+        if self.started_after_unclean_exit {
+            checks.push(HealthCheck {
+                id: "service.unclean_exit".into(),
+                name: "Previous session ended cleanly".into(),
+                ok: false,
+                severity: FindingSeverity::Warning,
+                detail: "the previous session did not shut down cleanly; see the incident log"
+                    .into(),
+            });
+        }
+
+        HealthReport {
+            checks,
+            generated_at_ms: crate::model::now_ms_for_report(),
+        }
+    }
+}
+
+/// Current Unix time in milliseconds.
+///
+/// A small helper so the model crate can stamp a report without depending on a clock
+/// abstraction; the service uses its injected clock for everything that affects a decision.
+pub(crate) fn now_ms_for_report() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
