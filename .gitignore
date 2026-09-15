@@ -4,3 +4,5 @@
 /apps/guardian-ui/gen
 *.log
 .DS_Store
+# Build output staged for a release; never committed.
+/dist

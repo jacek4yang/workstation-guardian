@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    name: Windows 11 x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the cache small and reproducible: only the registry and the built deps.
+          workspaces: ". -> target"
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        # Warnings are failures. A 24/7 service accumulates small defects otherwise.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        # Non-destructive by construction: no test reboots the machine, changes persistent
+        # update policy, or touches a real network link.
+        run: cargo test --workspace --all-features
+
+      - name: Build (release)
+        run: cargo build --workspace --release --all-features
+
+      - name: Audit dependencies
+        # Informational: a newly disclosed advisory should be visible without blocking every
+        # unrelated change on a transitive dependency.
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked --quiet || true
+          cargo audit --ignore-unmaintained || true
