@@ -1,0 +1,15 @@
+[package]
+name = "guardian-update"
+description = "Windows Update policy enforcement and verification for Workstation Guardian"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+guardian-proto.workspace = true
+guardian-core.workspace = true
+guardian-win.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

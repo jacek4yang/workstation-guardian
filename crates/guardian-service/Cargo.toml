@@ -1,0 +1,31 @@
+[package]
+name = "guardian-service"
+description = "Workstation Guardian Windows service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "guardian-service"
+path = "src/main.rs"
+
+[dependencies]
+guardian-proto.workspace = true
+guardian-core.workspace = true
+guardian-storage.workspace = true
+guardian-win.workspace = true
+guardian-process.workspace = true
+guardian-network.workspace = true
+guardian-update.workspace = true
+windows.workspace = true
+windows-service.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+time.workspace = true
+uuid.workspace = true
+regex.workspace = true

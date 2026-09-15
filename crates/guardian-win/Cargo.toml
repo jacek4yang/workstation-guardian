@@ -1,0 +1,15 @@
+[package]
+name = "guardian-win"
+description = "Safe wrappers over the Win32 APIs Workstation Guardian needs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+guardian-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+windows.workspace = true
+windows-service.workspace = true

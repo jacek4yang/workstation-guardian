@@ -1,0 +1,19 @@
+[package]
+name = "guardian-process"
+description = "Process inventory, graph and generic AI-agent detection for Workstation Guardian"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+guardian-proto.workspace = true
+guardian-core.workspace = true
+guardian-win.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

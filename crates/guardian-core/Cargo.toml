@@ -1,0 +1,14 @@
+[package]
+name = "guardian-core"
+description = "Pure protection state machines for Workstation Guardian"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+guardian-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+tracing.workspace = true

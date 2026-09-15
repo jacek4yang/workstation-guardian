@@ -1,0 +1,26 @@
+[package]
+name = "guardianctl"
+description = "Diagnostics, installation and service control for Workstation Guardian"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "guardianctl"
+path = "src/main.rs"
+
+[dependencies]
+guardian-proto.workspace = true
+guardian-core.workspace = true
+guardian-win.workspace = true
+guardian-update.workspace = true
+guardian-network.workspace = true
+guardian-process.workspace = true
+guardian-storage.workspace = true
+windows.workspace = true
+windows-service.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
