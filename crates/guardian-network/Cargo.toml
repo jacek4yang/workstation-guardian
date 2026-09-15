@@ -11,5 +11,12 @@ guardian-proto.workspace = true
 guardian-core.workspace = true
 guardian-win.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+guardian-process.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The network tests drive the worker with the fake clock, so the test-double feature is
+# enabled for test builds only. Production binaries never enable it.
+guardian-core = { path = "../guardian-core", features = ["test-fakes"] }

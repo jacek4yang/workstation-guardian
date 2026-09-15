@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes the test doubles in `ports::fakes` to dependent crates' test builds.
+# Never enabled for a production binary.
+test-fakes = []
+
 [dependencies]
 guardian-proto.workspace = true
 serde.workspace = true

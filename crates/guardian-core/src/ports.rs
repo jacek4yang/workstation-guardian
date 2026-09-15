@@ -129,11 +129,14 @@ pub trait BootIdentity {
     fn boot_id(&self) -> String;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fakes"))]
 pub mod fakes {
-    //! Test doubles shared by every state-machine test in this crate.
+    //! Test doubles shared by every state-machine test in this crate, and by the crates that
+    //! build on it.
     //!
-    //! These live behind `#[cfg(test)]` so production builds carry none of it.
+    //! Gated behind a feature as well as `cfg(test)` so that `guardian-network` and
+    //! `guardian-service` can drive their workers with a fake clock in their own tests,
+    //! without production binaries carrying any of this.
 
     use super::*;
     use std::cell::RefCell;
