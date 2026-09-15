@@ -754,3 +754,196 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Workload rules
+// ---------------------------------------------------------------------------
+
+/// A compiled workload rule: the data form plus a ready regex.
+#[derive(Debug)]
+pub struct CompiledWorkloadRule {
+    pub id: String,
+    pub display_name: String,
+    /// Matched against the lowercased image file name.
+    pub regex: regex::Regex,
+    /// Matched against the command line, when the rule requires corroboration.
+    pub cmdline: Option<regex::Regex>,
+    pub min_runtime_secs: u64,
+    pub protects_standalone: bool,
+}
+
+/// One workload rule specification: id, display name, name pattern, optional command-line
+/// pattern, minimum runtime in seconds, and whether it protects a build with no owning agent.
+type WorkloadSpec = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    u64,
+    bool,
+);
+
+/// Rules describing long-running development work worth protecting.
+///
+/// These are deliberately narrower than "anything that looks like a build". A rule that matches
+/// too broadly would make every machine with a background Node process believe work is in
+/// progress, which blocks shutdown for no reason and trains the operator to ignore the warning.
+///
+/// Build tools are included because losing a two-hour `cargo build` is real work. Interpreters
+/// (`node.exe`, `python.exe`) are deliberately **not** included as standalone workloads: they are
+/// far too common to mean anything on their own, and they are already covered when an agent owns
+/// them.
+pub fn workload_rules() -> &'static [CompiledWorkloadRule] {
+    // Compiled once for the process lifetime. These are consulted on every process sweep, so
+    // recompiling nine regexes every few seconds forever would be a real cost for no benefit.
+    static RULES: std::sync::OnceLock<Vec<CompiledWorkloadRule>> = std::sync::OnceLock::new();
+    RULES.get_or_init(build_workload_rules).as_slice()
+}
+
+/// Compile the workload rules. Called once, by [`workload_rules`].
+fn build_workload_rules() -> Vec<CompiledWorkloadRule> {
+    let specs: [WorkloadSpec; 9] = [
+        ("cargo", "cargo", r"^cargo(\.exe)?$", None, 60, true),
+        ("rustc", "rustc", r"^rustc(\.exe)?$", None, 30, true),
+        ("cmake", "cmake", r"^cmake(\.exe)?$", None, 60, true),
+        ("ninja", "ninja build", r"^ninja(\.exe)?$", None, 60, true),
+        ("msbuild", "MSBuild", r"^msbuild(\.exe)?$", None, 60, true),
+        (
+            "dotnet-build",
+            "dotnet build",
+            r"^dotnet(\.exe)?$",
+            Some(r"\bbuild\b"),
+            60,
+            true,
+        ),
+        ("make", "make", r"^(make|gmake)(\.exe)?$", None, 60, true),
+        (
+            "gradle",
+            "Gradle",
+            r"^(gradle|gradlew)(\.(exe|bat|cmd))?$",
+            None,
+            60,
+            true,
+        ),
+        (
+            "webpack",
+            "webpack build",
+            r"^node(\.exe)?$",
+            Some(r"webpack"),
+            120,
+            false,
+        ),
+    ];
+
+    // The `expect`s below are deliberate and are not a "no unwrap in production" violation: the
+    // patterns are static literals in the table under this function, and a test asserts every one
+    // of them compiles. Failing loudly here is strictly better than silently installing a
+    // never-matching rule, which would disable protection for a build tool without anyone
+    // noticing.
+    let mut out = Vec::with_capacity(specs.len());
+    for (id, display, name_pattern, cmdline_pattern, min_runtime, protects) in specs {
+        let regex = regex::Regex::new(&format!("(?i){name_pattern}")).unwrap_or_else(|e| {
+            panic!("the built-in workload pattern '{name_pattern}' is invalid: {e}")
+        });
+        let cmdline = cmdline_pattern.map(|p| {
+            regex::Regex::new(&format!("(?i){p}")).unwrap_or_else(|e| {
+                panic!("the built-in workload command-line pattern '{p}' is invalid: {e}")
+            })
+        });
+
+        out.push(CompiledWorkloadRule {
+            id: id.to_string(),
+            display_name: display.to_string(),
+            regex,
+            cmdline,
+            min_runtime_secs: min_runtime,
+            protects_standalone: protects,
+        });
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::*;
+
+    #[test]
+    fn every_workload_pattern_compiles() {
+        // Compilation panics on a bad pattern, so reaching this assertion at all proves the whole
+        // table is valid. The body checks the compiled rules are usable.
+        for rule in workload_rules() {
+            assert!(!rule.regex.as_str().is_empty());
+            assert!(
+                rule.regex.as_str().starts_with("(?i)"),
+                "rule '{}' must match case-insensitively, which Windows requires",
+                rule.id
+            );
+            assert!(!rule.display_name.is_empty());
+        }
+    }
+
+    #[test]
+    fn build_tools_are_matched_and_interpreters_are_not_broadly() {
+        let rules = workload_rules();
+        let matches = |name: &str| rules.iter().any(|r| r.regex.is_match(name));
+
+        for tool in [
+            "cargo.exe",
+            "rustc.exe",
+            "cmake.exe",
+            "ninja.exe",
+            "msbuild.exe",
+            "make.exe",
+        ] {
+            assert!(matches(tool), "{tool} should be a build workload");
+        }
+
+        // Interpreters must not be standalone workloads on their own; an idle background node
+        // process must not block shutdown.
+        assert!(
+            !matches("python.exe"),
+            "a bare python process is not a workload"
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.id == "node" && r.protects_standalone),
+            "no rule may protect a bare node process standalone"
+        );
+    }
+
+    #[test]
+    fn the_dotnet_rule_requires_the_build_subcommand() {
+        let rules = workload_rules();
+        let dotnet = rules
+            .iter()
+            .find(|r| r.id == "dotnet-build")
+            .expect("the rule exists");
+        assert!(dotnet.regex.is_match("dotnet.exe"));
+        // A bare `dotnet` invocation (for example `dotnet run` on a server) must not qualify.
+        assert!(dotnet
+            .cmdline
+            .as_ref()
+            .unwrap()
+            .is_match("dotnet build proj.sln"));
+        assert!(!dotnet.cmdline.as_ref().unwrap().is_match("dotnet run"));
+    }
+
+    #[test]
+    fn only_genuine_builds_protect_standalone() {
+        // The flag that decides whether a workload can hold a shutdown block without an agent
+        // needs to be deliberate, so it is asserted explicitly.
+        let rules = workload_rules();
+        for rule in rules {
+            if rule.protects_standalone {
+                assert!(
+                    rule.min_runtime_secs >= 30,
+                    "rule '{}' protects standalone with only a {}s threshold",
+                    rule.id,
+                    rule.min_runtime_secs
+                );
+            }
+        }
+    }
+}

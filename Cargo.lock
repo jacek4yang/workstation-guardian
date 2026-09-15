@@ -169,6 +169,7 @@ name = "guardian-session"
 version = "0.1.0"
 dependencies = [
  "guardian-proto",
+ "guardian-service",
  "guardian-win",
  "serde",
  "serde_json",

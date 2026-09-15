@@ -6,8 +6,9 @@
 //! exercised by the same well-tested scoring path.
 
 use guardian_proto::model::{
-    AgentCandidate, AgentConfig, AgentInstance, AgentSignature, AncestorRef, Confidence, Evidence,
-    ProcessSnapshot, Rule, RuleField, SignatureConfidence,
+    AgentCandidate, AgentConfig, AgentGroup, AgentInstance, AgentInventory, AgentSignature,
+    AncestorRef, Confidence, Evidence, MonitorHealth, ProcessSnapshot, ProtectedWorkload, Rule,
+    RuleField, SignatureConfidence,
 };
 use regex::Regex;
 
@@ -690,6 +691,177 @@ pub fn group_sessions_with_pids(
     }
 
     instances
+}
+
+/// Assemble a complete inventory from detections.
+///
+/// This is the single place that turns raw detections into what the rest of the system consumes:
+/// agents grouped into sessions, protected workloads attributed to their owning session, and the
+/// unconfirmed candidates that never drive protection.
+///
+/// Workload attribution is the important part. A build tool spawned by an agent belongs to that
+/// agent's session, which is what makes "cargo is running because Claude Code asked it to"
+/// distinguishable from "some unrelated cargo is running".
+pub fn build_inventory(
+    detections: Vec<(ProcessSnapshot, Detection)>,
+    graph: &ProcessGraph,
+    adapters: &crate::adapters::Adapters,
+    candidates: Vec<AgentCandidate>,
+    now_ms: i64,
+    monitor: MonitorHealth,
+) -> AgentInventory {
+    // Group into agent sessions first, so workloads can be attributed to them.
+    let mut instances = group_sessions_with_pids(detections, graph);
+
+    // Enrich with adapter metadata. Only agents whose signature declares an adapter are queried,
+    // so an agent Guardian does not understand is left alone rather than guessed at.
+    for instance in &mut instances {
+        let adapter_kind = crate::builtins::signatures()
+            .iter()
+            .find(|s| s.id == instance.kind)
+            .and_then(|s| s.adapter);
+
+        let result = adapters.lookup(adapter_kind, instance.pid, instance.started_at_filetime);
+        if result.project.is_some() {
+            instance.project = result.project;
+        }
+        if result.resume != guardian_proto::model::ResumeCapability::Unavailable {
+            instance.resume = result.resume;
+        }
+        instance.started_at_ms = crate::graph::filetime_to_unix_ms(instance.started_at_filetime);
+    }
+
+    // Build the session-id set for workload attribution.
+    let session_roots: Vec<(u32, String, String)> = instances
+        .iter()
+        .map(|i| (i.root_pid, i.session_id.clone(), i.display_name.clone()))
+        .collect();
+
+    let workloads = detect_workloads(graph, &session_roots, now_ms);
+
+    // Group instances by agent kind.
+    let mut groups: std::collections::BTreeMap<String, AgentGroup> =
+        std::collections::BTreeMap::new();
+    for instance in instances {
+        let entry = groups
+            .entry(instance.kind.clone())
+            .or_insert_with(|| AgentGroup {
+                kind: instance.kind.clone(),
+                display_name: instance.display_name.clone(),
+                instances: Vec::new(),
+                confidence: Confidence::Unknown,
+            });
+        // The group's confidence is the highest among its instances.
+        if instance.confidence > entry.confidence {
+            entry.confidence = instance.confidence;
+        }
+        entry.instances.push(instance);
+    }
+
+    AgentInventory {
+        agents: groups.into_values().collect(),
+        workloads,
+        candidates,
+        updated_at_ms: now_ms,
+        monitor,
+    }
+}
+
+/// Detect long-running development workloads and attribute them to an agent session.
+///
+/// A workload owned by an agent session is always protected, because the agent is waiting on it.
+/// A standalone build is only protected when the caller asks for it, which is what keeps an idle
+/// background process from blocking shutdown forever.
+fn detect_workloads(
+    graph: &ProcessGraph,
+    session_roots: &[(u32, String, String)],
+    now_ms: i64,
+) -> Vec<ProtectedWorkload> {
+    let rules = crate::builtins::workload_rules();
+    let mut out = Vec::new();
+
+    for process in graph.iter() {
+        let name = process.name_lower();
+
+        let Some(rule) = rules.iter().find(|r| {
+            r.regex.is_match(&name)
+                && r.cmdline
+                    .as_ref()
+                    .map(|c| {
+                        process
+                            .cmdline
+                            .as_deref()
+                            .map(|cmd| c.is_match(cmd))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true)
+        }) else {
+            continue;
+        };
+
+        // Attribute this process to an agent session, if any ancestor owns one.
+        // Attribute this process to an agent session when an agent owns it. The subtree walk is
+        // bounded, and the rule set is small, so this stays cheap.
+        let owner = session_roots
+            .iter()
+            .find(|(root, _, _)| {
+                *root != process.pid && graph.subtree(*root, 512).contains(&process.pid)
+            })
+            .map(|(_, session, kind)| (session.clone(), kind.clone()));
+
+        let started_ms = crate::graph::filetime_to_unix_ms(process.created_filetime);
+        let running_ms = if started_ms > 0 {
+            now_ms.saturating_sub(started_ms)
+        } else {
+            0
+        };
+
+        // A standalone workload must have run long enough to be worth protecting. An owned one is
+        // protected immediately, because the agent that spawned it is blocked on it.
+        let qualifies = if owner.is_some() {
+            true
+        } else {
+            let threshold_ms = (rule.min_runtime_secs * 1000) as i64;
+            threshold_ms == 0 || running_ms >= threshold_ms
+        };
+
+        if !qualifies {
+            continue;
+        }
+
+        out.push(ProtectedWorkload {
+            rule_id: rule.id.clone(),
+            display_name: rule.display_name.clone(),
+            pid: process.pid,
+            identity: process.identity(),
+            owner_session: owner.as_ref().map(|(s, _)| s.clone()),
+            owner_kind: owner.map(|(_, k)| k),
+            started_at_ms: started_ms,
+            running_ms,
+            image_path: process.image_path.clone(),
+            cmdline: process.cmdline.clone(),
+            reason: if owner_kind_present(graph, process.pid, session_roots) {
+                "spawned by a detected agent and still running".to_string()
+            } else {
+                format!(
+                    "running for {}s, over the {}s threshold",
+                    running_ms / 1000,
+                    rule.min_runtime_secs
+                )
+            },
+        });
+    }
+
+    // Newest first, so the UI shows what just started at the top.
+    out.sort_by_key(|w| std::cmp::Reverse(w.started_at_ms));
+    out.truncate(64);
+    out
+}
+
+fn owner_kind_present(graph: &ProcessGraph, pid: u32, roots: &[(u32, String, String)]) -> bool {
+    roots
+        .iter()
+        .any(|(root, _, _)| *root != pid && graph.subtree(*root, 512).contains(&pid))
 }
 
 /// Build candidates for processes that look agent-like but scored below the reporting bar.

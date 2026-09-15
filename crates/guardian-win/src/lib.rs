@@ -30,6 +30,7 @@ pub mod process;
 pub mod ras;
 pub mod registry;
 pub mod service;
+pub mod service_host;
 pub mod session;
 pub mod wifi;
 

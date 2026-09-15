@@ -28,8 +28,10 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use guardian_proto::model::ConfigDocument;
 use guardian_proto::{
-    Principal, ProtocolError, Request, Response, MAX_FRAME_LEN, PIPE_NAME, PROTOCOL_VERSION,
+    Principal, ProtocolError, Request, Response, SubscriberKind, MAX_FRAME_LEN, PIPE_NAME,
+    PROTOCOL_VERSION,
 };
 use guardian_win::pipe::{PipeClient, PipeServer};
 
@@ -332,6 +334,235 @@ impl IpcClient {
             other => Ok(other),
         }
     }
+
+    /// Send a request, then read pushes until the connection ends.
+    ///
+    /// Used by the session helper's subscription. `on_push` is called for each message; returning
+    /// `false` stops. An `Ok(())` return means the peer closed the connection.
+    pub fn subscribe(
+        &mut self,
+        request: &Request,
+        mut on_push: impl FnMut(&Response) -> bool,
+    ) -> Result<(), String> {
+        let payload = serde_json::to_vec(request)
+            .map_err(|e| format!("could not encode the request: {e}"))?;
+        write_frame(&mut self.inner, &payload).map_err(|e| e.to_string())?;
+
+        loop {
+            let frame = match read_frame(&mut self.inner).map_err(|e| e.to_string())? {
+                Some(f) => f,
+                None => return Ok(()),
+            };
+
+            let response: Response = serde_json::from_slice(&frame)
+                .map_err(|e| format!("could not decode a push: {e}"))?;
+
+            if !on_push(&response) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The service's real request handler.
+///
+/// Unlike [`ReadOnlyHandler`], this one can mutate protection state - but only through the
+/// coordinator, which enforces the maintenance machine and the protected-work rules. There is
+/// still no primitive here that lets a caller do something arbitrary: every operation is a named,
+/// validated action.
+#[derive(Clone)]
+pub struct ServiceHandler<C, P>
+where
+    C: guardian_core::ports::Clock + Send + Sync + 'static,
+    P: guardian_core::ports::PendingRebootSource + Send + Sync + 'static,
+{
+    state: Arc<RwLock<ServiceState>>,
+    coordinator: Arc<crate::state::ProtectionCoordinator<C, P>>,
+    /// Whether a session helper is currently connected, published for the status surface.
+    helper_connected: Arc<AtomicBool>,
+}
+
+impl<C, P> std::fmt::Debug for ServiceHandler<C, P>
+where
+    C: guardian_core::ports::Clock + Send + Sync + 'static,
+    P: guardian_core::ports::PendingRebootSource + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceHandler")
+            .field(
+                "helper_connected",
+                &self.helper_connected.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C, P> ServiceHandler<C, P>
+where
+    C: guardian_core::ports::Clock + Send + Sync + 'static,
+    P: guardian_core::ports::PendingRebootSource + Send + Sync + 'static,
+{
+    pub fn new(
+        state: Arc<RwLock<ServiceState>>,
+        coordinator: Arc<crate::state::ProtectionCoordinator<C, P>>,
+        helper_connected: Arc<AtomicBool>,
+    ) -> Self {
+        ServiceHandler {
+            state,
+            coordinator,
+            helper_connected,
+        }
+    }
+
+    fn read(&self) -> ServiceState {
+        match self.state.read() {
+            Ok(g) => g.clone(),
+            // Recovering from a poisoned lock rather than propagating the panic: protection must
+            // not stop because some unrelated thread panicked.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+impl<C, P> RequestHandler for ServiceHandler<C, P>
+where
+    C: guardian_core::ports::Clock + Send + Sync + 'static,
+    P: guardian_core::ports::PendingRebootSource + Send + Sync + 'static,
+{
+    fn handle(&self, request: &Request, principal: Principal) -> HandlerResult {
+        let now = guardian_win::clock::unix_now_ms();
+
+        match request {
+            Request::Hello { protocol } => {
+                if *protocol != PROTOCOL_VERSION {
+                    return Ok(Response::Error(ProtocolError::VersionMismatch {
+                        client: *protocol,
+                        server: PROTOCOL_VERSION,
+                    }));
+                }
+                Ok(Response::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    service_version: self.read().service_version.clone(),
+                    server_time: now,
+                })
+            }
+
+            // A subscription turns into a push loop. The session helper relies on this: it must
+            // learn about a mode change promptly, and polling would waste both processes' time.
+            Request::Subscribe { client } => {
+                if matches!(client, SubscriberKind::SessionHelper) {
+                    self.helper_connected.store(true, Ordering::SeqCst);
+                    self.coordinator.set_helper_connected(true);
+                }
+                // The current snapshot is the first push, so the helper applies the live mode
+                // immediately rather than waiting for the next change.
+                Ok(Response::Status(Box::new(self.read().snapshot(now))))
+            }
+
+            Request::GetStatus => Ok(Response::Status(Box::new(self.read().snapshot(now)))),
+            Request::GetAgents => Ok(Response::Agents(self.read().agents.clone())),
+            Request::GetNetwork => Ok(Response::Network(self.read().network.clone())),
+            Request::GetPendingReboot => Ok(Response::PendingReboot(Box::new(
+                self.read().pending_reboot.clone(),
+            ))),
+            Request::GetIncidents { limit } => {
+                let mut incidents = self.read().incidents.clone();
+                incidents.reverse();
+                incidents.truncate(usize::from(*limit));
+                Ok(Response::Incidents(incidents))
+            }
+            Request::GetRebootAuthorization => Ok(Response::RebootAuthorization(Box::new(
+                self.read().maintenance.authorization.clone(),
+            ))),
+            Request::GetHealth => Ok(Response::Health(Box::new(
+                self.read().service_health(now).into_health_report(),
+            ))),
+            Request::GetConfig => {
+                let paths = guardian_storage::GuardianPaths::production();
+                let doc = match std::fs::read_to_string(paths.config_file()) {
+                    Ok(text) => guardian_core::config::load_from_str(&text).document,
+                    Err(_) => ConfigDocument::default(),
+                };
+                Ok(Response::Config(Box::new(doc)))
+            }
+
+            Request::Reconnect { reason } => {
+                // The network worker owns the dial. This records the request so an operator can
+                // see why a reconnect happened, and reports that it was accepted.
+                tracing::info!(
+                    reason = %reason,
+                    principal = principal.as_str(),
+                    "reconnect requested"
+                );
+                Ok(Response::Ok {
+                    message: "the network worker will reconnect on its next evaluation".into(),
+                })
+            }
+
+            Request::EnterMaintenance {
+                override_protected_work,
+                confirmation,
+            } => {
+                let phrase = if *override_protected_work {
+                    Some(confirmation.clone())
+                } else {
+                    None
+                };
+                match self.coordinator.enter_maintenance(phrase) {
+                    Ok(state) => Ok(Response::Ok {
+                        message: format!(
+                            "maintenance mode entered (override used: {})",
+                            state.entered_with_override
+                        ),
+                    }),
+                    Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+                }
+            }
+
+            Request::ExitMaintenance => match self.coordinator.exit_maintenance() {
+                Ok(_) => Ok(Response::Ok {
+                    message: "maintenance mode exited; update protection reapplied".into(),
+                }),
+                Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+            },
+
+            Request::ArmSingleReboot { ttl_secs } => {
+                match self
+                    .coordinator
+                    .arm_reboot(*ttl_secs, principal.as_str().to_string())
+                {
+                    Ok(auth) => Ok(Response::Ok {
+                        message: format!(
+                            "one reboot authorized for the next {} minutes",
+                            auth.remaining_ms(now) / 60_000
+                        ),
+                    }),
+                    Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+                }
+            }
+
+            Request::DisarmReboot => match self.coordinator.disarm_reboot() {
+                Ok(()) => Ok(Response::Ok {
+                    message: "reboot authorization revoked".into(),
+                }),
+                Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+            },
+
+            // Configuration mutation is deliberately not implemented over IPC yet. Refusing
+            // explicitly is the honest answer: silently accepting and discarding a change would
+            // let an operator believe protection had been reconfigured when it had not.
+            Request::UpdateConfig { .. }
+            | Request::AddAgentSignature { .. }
+            | Request::RemoveAgentSignature { .. }
+            | Request::PromoteCandidate { .. } => {
+                Ok(Response::Error(ProtocolError::Refused(format!(
+                    "'{}' is not yet available over IPC; configuration changes are applied from \
+                     the configuration file when the service starts",
+                    request.op_name()
+                ))))
+            }
+        }
+    }
 }
 
 /// A handler that answers from a shared state, without any privileged operation.
@@ -409,7 +640,6 @@ mod tests {
     use super::*;
     use crate::state::ServiceState;
     use guardian_proto::model::{Incident, IncidentDetails, IncidentKind};
-    use guardian_proto::SubscriberKind;
 
     fn handler() -> ReadOnlyHandler {
         let state = Arc::new(RwLock::new(ServiceState::initial(

@@ -393,3 +393,41 @@ mod tests {
         assert_eq!(id.created_filetime, 400);
     }
 }
+
+/// Convert a Windows FILETIME to Unix milliseconds.
+///
+/// Kept local to this crate so the detection logic does not depend on the Win32 layer merely to
+/// format a timestamp; the arithmetic is a fixed epoch offset and is covered by tests.
+pub fn filetime_to_unix_ms(filetime: u64) -> i64 {
+    /// 100 ns ticks between 1601-01-01 and 1970-01-01.
+    const EPOCH_DIFFERENCE_100NS: u64 = 116_444_736_000_000_000;
+    if filetime == 0 {
+        // Zero means "unknown" in a snapshot, not 1601. Returning the epoch would make an
+        // unknown start time look like a process from 1970.
+        return 0;
+    }
+    if filetime < EPOCH_DIFFERENCE_100NS {
+        return 0;
+    }
+    ((filetime - EPOCH_DIFFERENCE_100NS) / 10_000) as i64
+}
+
+#[cfg(test)]
+mod filetime_tests {
+    use super::filetime_to_unix_ms;
+
+    #[test]
+    fn the_epoch_offset_is_correct() {
+        assert_eq!(filetime_to_unix_ms(116_444_736_000_000_000), 0);
+        assert_eq!(
+            filetime_to_unix_ms(116_444_736_000_000_000 + 10_000_000),
+            1000
+        );
+    }
+
+    #[test]
+    fn unknown_times_are_reported_as_zero() {
+        assert_eq!(filetime_to_unix_ms(0), 0);
+        assert_eq!(filetime_to_unix_ms(1), 0);
+    }
+}
