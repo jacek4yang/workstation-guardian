@@ -37,6 +37,13 @@ use guardian_win::pipe::{PipeClient, PipeServer};
 
 use crate::state::ServiceState;
 
+/// How long a served connection may sit idle before it is released.
+///
+/// The accept loop serves one connection at a time, so a client that connects and then says
+/// nothing would otherwise block every other client. Long enough that a client sending several
+/// requests in a row is never cut off, short enough that a stuck client is not a denial of service.
+const IDLE_TIMEOUT_MS: u64 = 2_000;
+
 /// The result of authorizing and dispatching one request.
 pub type HandlerResult = Result<Response, ProtocolError>;
 
@@ -109,10 +116,10 @@ pub fn write_frame<W: io::Write>(writer: &mut W, payload: &[u8]) -> io::Result<(
 /// Decode a request, mapping a decode failure to a protocol error rather than a panic.
 pub fn decode_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
     if bytes.is_empty() {
-        return Err(ProtocolError::InvalidRequest("empty frame".into()));
+        return Err(ProtocolError::invalid_request("empty frame"));
     }
     serde_json::from_slice(bytes)
-        .map_err(|e| ProtocolError::InvalidRequest(format!("malformed request: {e}")))
+        .map_err(|e| ProtocolError::invalid_request(format!("malformed request: {e}")))
 }
 
 /// Encode a response.
@@ -127,10 +134,23 @@ pub fn encode_response(response: &Response) -> Vec<u8> {
     })
 }
 
-/// Serve one connected client until it disconnects or errors.
+/// Serve one connected client until it disconnects, goes idle, or errors.
 ///
-/// Returns the number of requests served, which the caller can use to decide whether a
-/// connection was productive.
+/// Returns the number of requests served.
+///
+/// # Why the connection is not closed after one exchange
+///
+/// `DisconnectNamedPipe` discards anything the client has already written. Returning after a
+/// single request and disconnecting therefore has a race: a client that connected and sent its
+/// request in the moment before the disconnect loses that request. From the client's side the
+/// write succeeded and the read failed, which is indistinguishable from the service having died.
+///
+/// # Why it does not wait forever
+///
+/// The accept loop serves one connection at a time, so a client that opens a connection and then
+/// says nothing would block every other client indefinitely - a trivial local denial of service.
+/// The loop therefore waits only a bounded idle period for the next request. A client that keeps
+/// talking is served continuously; one that goes quiet is released.
 pub fn serve_connection(
     server: &mut PipeServer,
     handler: &dyn RequestHandler,
@@ -144,9 +164,32 @@ pub fn serve_connection(
             return Ok(served);
         }
 
+        // Wait for the client to say something, but only for a bounded time. Checking a deadline
+        // *between* reads would not help: the read itself is what blocks, so the bound has to be
+        // on the read. Without this, a client that opens a connection and says nothing holds the
+        // single-threaded accept loop indefinitely.
+        match server.wait_for_data(IDLE_TIMEOUT_MS as u32) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Nothing arrived in time. A client that has already had an answer is done with
+                // us; one that has not may simply be slow to speak, so it is given one more
+                // window before the connection is released.
+                if served > 0 {
+                    tracing::debug!(served, "client went idle; releasing the connection");
+                    return Ok(served);
+                }
+                continue;
+            }
+            Err(e) => {
+                // The peer closed or the pipe failed.
+                tracing::debug!(error = %e, "connection ended while waiting for a request");
+                return Ok(served);
+            }
+        }
+
         let frame = match read_frame(server) {
             Ok(Some(f)) => f,
-            // A clean disconnect.
+            // A clean disconnect: the client is done with us.
             Ok(None) => return Ok(served),
             Err(e) => {
                 tracing::debug!(error = %e, "closing a connection after a read error");
@@ -166,7 +209,7 @@ pub fn serve_connection(
                         required = required.as_str(),
                         "refused an unauthorized request"
                     );
-                    Response::Error(ProtocolError::NotPermitted {
+                    Response::error(ProtocolError::NotPermitted {
                         op: op.to_string(),
                         required,
                         actual: principal,
@@ -175,11 +218,11 @@ pub fn serve_connection(
                     tracing::debug!(op, principal = principal.as_str(), "handling a request");
                     match handler.handle(&request, principal) {
                         Ok(r) => r,
-                        Err(e) => Response::Error(e),
+                        Err(e) => Response::error(e),
                     }
                 }
             }
-            Err(e) => Response::Error(e),
+            Err(e) => Response::error(e),
         };
 
         let encoded = encode_response(&response);
@@ -190,11 +233,10 @@ pub fn serve_connection(
 
         served += 1;
 
-        // One-shot semantics: a status query or a command is a complete exchange, and
-        // keeping the connection open would let a client hold a pipe instance indefinitely.
-        // The one exception is a subscription, which the caller handles separately.
-        if !matches!(decode_request(&frame), Ok(Request::Subscribe { .. })) {
-            return Ok(served);
+        // A subscription is a push channel, not a request/response exchange: the caller handles it
+        // by keeping the connection open, so it does not return here.
+        if matches!(decode_request(&frame), Ok(Request::Subscribe { .. })) {
+            continue;
         }
     }
 }
@@ -252,25 +294,53 @@ impl IpcServer {
     pub fn run(&self) -> io::Result<()> {
         tracing::info!(pipe = PIPE_NAME, "IPC server listening");
 
-        while !self.shutdown.load(Ordering::Relaxed) {
-            let mut server = match PipeServer::create(PIPE_NAME) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "could not create the IPC pipe");
-                    // Back off rather than spinning on a persistent failure.
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    continue;
-                }
-            };
+        // # Why a spare instance is created before serving
+        //
+        // A named pipe only accepts a connection when an instance is *listening*. If the server
+        // serves a client on its only instance, there is no listening instance during that time:
+        // a second client arriving in the window connects to a pipe that exists but has nobody
+        // accepting, and is closed with ERROR_PIPE_NOT_CONNECTED ("no process on the other end").
+        //
+        // Creating the next instance *before* serving the current one closes that window. This is
+        // the documented pattern for a serial pipe server, and it is why the pipe is created with
+        // `PIPE_UNLIMITED_INSTANCES`: there are at most two live at once, the one being served and
+        // the one listening.
+        let mut listener = match PipeServer::create(PIPE_NAME) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "could not create the IPC pipe");
+                return Err(io::Error::other(e.to_string()));
+            }
+        };
 
-            match server.wait_for_client(guardian_win::pipe::CONNECT_TIMEOUT_MS) {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            // A timeout here is the normal case: it is how the loop notices a shutdown request.
+            match listener.wait_for_client(guardian_win::pipe::CONNECT_TIMEOUT_MS) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
-                    tracing::debug!(error = %e, "IPC accept failed; continuing");
+                    tracing::warn!(error = %e, "IPC accept failed; recreating the listener");
+                    match PipeServer::create(PIPE_NAME) {
+                        Ok(s) => listener = s,
+                        Err(e) => {
+                            tracing::error!(error = %e, "could not recreate the IPC pipe");
+                            return Err(io::Error::other(e.to_string()));
+                        }
+                    }
                     continue;
                 }
             }
+
+            // Arm the next instance now, so a client arriving while this one is served finds
+            // somebody listening.
+            let mut serving = listener;
+            listener = match PipeServer::create(PIPE_NAME) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not create the next IPC instance");
+                    return Err(io::Error::other(e.to_string()));
+                }
+            };
 
             // The principal is derived here. Until a reliable per-connection token query is
             // wired, the conservative default is the lowest principal, so a failure to
@@ -278,20 +348,21 @@ impl IpcServer {
             let principal = Principal::InteractiveUser;
 
             match serve_connection(
-                &mut server,
+                &mut serving,
                 self.handler.as_ref(),
                 principal,
                 &self.shutdown,
             ) {
                 Ok(count) => {
                     self.served.fetch_add(u64::from(count), Ordering::Relaxed);
+                    // Return the served instance to the listening state so it can accept again.
+                    serving.disconnect();
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "connection ended with an error");
+                    serving.disconnect();
                 }
             }
-
-            server.disconnect();
         }
 
         tracing::info!("IPC server stopped");
@@ -314,6 +385,11 @@ impl IpcClient {
     }
 
     /// Send a request and read the response.
+    ///
+    /// No retry is needed here: the server keeps a spare listening instance armed so a connection
+    /// is never accepted by an instance that nobody is serving, and its accept path never discards
+    /// an arriving client. A failure therefore means the service really is unavailable, and
+    /// reporting that promptly is more useful than retrying.
     pub fn call(&mut self, request: &Request) -> Result<Response, String> {
         let payload = serde_json::to_vec(request)
             .map_err(|e| format!("could not encode the request: {e}"))?;
@@ -330,7 +406,7 @@ impl IpcClient {
     /// Send a request and unwrap the expected response variant.
     pub fn call_expect(&mut self, request: &Request) -> Result<Response, String> {
         match self.call(request)? {
-            Response::Error(e) => Err(e.to_string()),
+            Response::Error { error } => Err(error.to_string()),
             other => Ok(other),
         }
     }
@@ -435,7 +511,7 @@ where
         match request {
             Request::Hello { protocol } => {
                 if *protocol != PROTOCOL_VERSION {
-                    return Ok(Response::Error(ProtocolError::VersionMismatch {
+                    return Ok(Response::error(ProtocolError::VersionMismatch {
                         client: *protocol,
                         server: PROTOCOL_VERSION,
                     }));
@@ -456,34 +532,34 @@ where
                 }
                 // The current snapshot is the first push, so the helper applies the live mode
                 // immediately rather than waiting for the next change.
-                Ok(Response::Status(Box::new(self.read().snapshot(now))))
+                Ok(Response::status(self.read().snapshot(now)))
             }
 
-            Request::GetStatus => Ok(Response::Status(Box::new(self.read().snapshot(now)))),
-            Request::GetAgents => Ok(Response::Agents(self.read().agents.clone())),
-            Request::GetNetwork => Ok(Response::Network(self.read().network.clone())),
-            Request::GetPendingReboot => Ok(Response::PendingReboot(Box::new(
-                self.read().pending_reboot.clone(),
-            ))),
+            Request::GetStatus => Ok(Response::status(self.read().snapshot(now))),
+            Request::GetAgents => Ok(Response::agents(self.read().agents.as_ref().clone())),
+            Request::GetNetwork => Ok(Response::network(self.read().network.as_ref().clone())),
+            Request::GetPendingReboot => {
+                Ok(Response::pending_reboot(self.read().pending_reboot.clone()))
+            }
             Request::GetIncidents { limit } => {
                 let mut incidents = self.read().incidents.clone();
                 incidents.reverse();
                 incidents.truncate(usize::from(*limit));
-                Ok(Response::Incidents(incidents))
+                Ok(Response::incidents(incidents))
             }
-            Request::GetRebootAuthorization => Ok(Response::RebootAuthorization(Box::new(
+            Request::GetRebootAuthorization => Ok(Response::reboot_authorization(
                 self.read().maintenance.authorization.clone(),
-            ))),
-            Request::GetHealth => Ok(Response::Health(Box::new(
+            )),
+            Request::GetHealth => Ok(Response::health(
                 self.read().service_health(now).into_health_report(),
-            ))),
+            )),
             Request::GetConfig => {
                 let paths = guardian_storage::GuardianPaths::production();
                 let doc = match std::fs::read_to_string(paths.config_file()) {
                     Ok(text) => guardian_core::config::load_from_str(&text).document,
                     Err(_) => ConfigDocument::default(),
                 };
-                Ok(Response::Config(Box::new(doc)))
+                Ok(Response::config(doc))
             }
 
             Request::Reconnect { reason } => {
@@ -515,7 +591,7 @@ where
                             state.entered_with_override
                         ),
                     }),
-                    Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+                    Err(e) => Ok(Response::error(ProtocolError::refused(e))),
                 }
             }
 
@@ -523,7 +599,7 @@ where
                 Ok(_) => Ok(Response::Ok {
                     message: "maintenance mode exited; update protection reapplied".into(),
                 }),
-                Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+                Err(e) => Ok(Response::error(ProtocolError::refused(e))),
             },
 
             Request::ArmSingleReboot { ttl_secs } => {
@@ -537,7 +613,7 @@ where
                             auth.remaining_ms(now) / 60_000
                         ),
                     }),
-                    Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+                    Err(e) => Ok(Response::error(ProtocolError::refused(e))),
                 }
             }
 
@@ -545,7 +621,7 @@ where
                 Ok(()) => Ok(Response::Ok {
                     message: "reboot authorization revoked".into(),
                 }),
-                Err(e) => Ok(Response::Error(ProtocolError::Refused(e))),
+                Err(e) => Ok(Response::error(ProtocolError::refused(e))),
             },
 
             // Configuration mutation is deliberately not implemented over IPC yet. Refusing
@@ -555,7 +631,7 @@ where
             | Request::AddAgentSignature { .. }
             | Request::RemoveAgentSignature { .. }
             | Request::PromoteCandidate { .. } => {
-                Ok(Response::Error(ProtocolError::Refused(format!(
+                Ok(Response::error(ProtocolError::refused(format!(
                     "'{}' is not yet available over IPC; configuration changes are applied from \
                      the configuration file when the service starts",
                     request.op_name()
@@ -595,7 +671,7 @@ impl RequestHandler for ReadOnlyHandler {
         match request {
             Request::Hello { protocol } => {
                 if *protocol != PROTOCOL_VERSION {
-                    return Ok(Response::Error(ProtocolError::VersionMismatch {
+                    return Ok(Response::error(ProtocolError::VersionMismatch {
                         client: *protocol,
                         server: PROTOCOL_VERSION,
                     }));
@@ -606,28 +682,26 @@ impl RequestHandler for ReadOnlyHandler {
                     server_time: now,
                 })
             }
-            Request::GetStatus => Ok(Response::Status(Box::new(state.snapshot(now)))),
-            Request::GetAgents => Ok(Response::Agents(state.agents.clone())),
-            Request::GetNetwork => Ok(Response::Network(state.network.clone())),
-            Request::GetPendingReboot => Ok(Response::PendingReboot(Box::new(
-                state.pending_reboot.clone(),
-            ))),
+            Request::GetStatus => Ok(Response::status(state.snapshot(now))),
+            Request::GetAgents => Ok(Response::agents(state.agents.as_ref().clone())),
+            Request::GetNetwork => Ok(Response::network(state.network.as_ref().clone())),
+            Request::GetPendingReboot => Ok(Response::pending_reboot(state.pending_reboot.clone())),
             Request::GetIncidents { limit } => {
                 let mut incidents = state.incidents.clone();
                 // Newest first, bounded by the caller's limit.
                 incidents.reverse();
                 incidents.truncate(usize::from(*limit));
-                Ok(Response::Incidents(incidents))
+                Ok(Response::incidents(incidents))
             }
-            Request::GetRebootAuthorization => Ok(Response::RebootAuthorization(Box::new(
+            Request::GetRebootAuthorization => Ok(Response::reboot_authorization(
                 state.maintenance.authorization.clone(),
-            ))),
-            Request::GetHealth => Ok(Response::Health(Box::new(
+            )),
+            Request::GetHealth => Ok(Response::health(
                 crate::state::ServiceState::service_health(&state, now).into_health_report(),
-            ))),
+            )),
             // Mutating and configuration operations are not available here. Returning a
             // refusal rather than silently succeeding keeps the boundary honest.
-            other => Ok(Response::Error(ProtocolError::Refused(format!(
+            other => Ok(Response::error(ProtocolError::refused(format!(
                 "the operation '{}' is not available in this context",
                 other.op_name()
             )))),
@@ -850,14 +924,14 @@ mod tests {
 
     #[test]
     fn responses_encode_even_when_they_contain_errors() {
-        let response = Response::Error(ProtocolError::NotPermitted {
+        let response = Response::error(ProtocolError::NotPermitted {
             op: "update_config".into(),
             required: Principal::Administrator,
             actual: Principal::InteractiveUser,
         });
         let bytes = encode_response(&response);
         let decoded: Response = serde_json::from_slice(&bytes).unwrap();
-        assert!(matches!(decoded, Response::Error(_)));
+        assert!(matches!(decoded, Response::Error { .. }));
     }
 
     // ---- handler ----
@@ -866,7 +940,7 @@ mod tests {
     fn the_handler_answers_status_queries() {
         let h = handler();
         match h.handle(&Request::GetStatus, Principal::InteractiveUser) {
-            Ok(Response::Status(s)) => {
+            Ok(Response::Status { snapshot: s }) => {
                 assert_eq!(s.boot_id, "boot-1");
                 assert_eq!(s.service_version, "0.1.0");
                 // A fresh service must not claim protection.
@@ -894,7 +968,12 @@ mod tests {
             &Request::Hello { protocol: 999 },
             Principal::InteractiveUser,
         ) {
-            Ok(Response::Error(ProtocolError::VersionMismatch { client, server })) => {
+            Ok(Response::Error { error: boxed })
+                if matches!(boxed.as_ref(), ProtocolError::VersionMismatch { .. }) =>
+            {
+                let ProtocolError::VersionMismatch { client, server } = *boxed else {
+                    unreachable!("guarded above")
+                };
                 assert_eq!(client, 999);
                 assert_eq!(server, PROTOCOL_VERSION);
             }
@@ -929,7 +1008,7 @@ mod tests {
             &Request::GetIncidents { limit: 10 },
             Principal::InteractiveUser,
         ) {
-            Ok(Response::Incidents(v)) => {
+            Ok(Response::Incidents { incidents: v }) => {
                 assert_eq!(v.len(), 10, "the limit must be honoured");
                 // Newest first.
                 assert_eq!(v[0].id, "i49");
@@ -944,7 +1023,12 @@ mod tests {
         // caller cannot believe a change was applied when it was not.
         let h = handler();
         match h.handle(&Request::ExitMaintenance, Principal::Administrator) {
-            Ok(Response::Error(ProtocolError::Refused(msg))) => {
+            Ok(Response::Error { error })
+                if matches!(error.as_ref(), ProtocolError::Refused { .. }) =>
+            {
+                let ProtocolError::Refused { message: msg } = *error else {
+                    unreachable!("guarded above")
+                };
                 assert!(msg.contains("exit_maintenance"), "got: {msg}");
             }
             other => panic!("unexpected: {other:?}"),
@@ -1018,7 +1102,7 @@ mod tests {
         let response: Response = serde_json::from_slice(&frame).expect("decode");
 
         match response {
-            Response::Status(s) => assert_eq!(s.boot_id, "boot-1"),
+            Response::Status { snapshot: s } => assert_eq!(s.boot_id, "boot-1"),
             other => panic!("unexpected response: {other:?}"),
         }
 
@@ -1041,3 +1125,7 @@ mod tests {
         assert!(server.helper_connected());
     }
 }
+
+#[cfg(test)]
+#[path = "ipc_tests.rs"]
+mod integration;

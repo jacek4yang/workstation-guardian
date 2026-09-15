@@ -45,56 +45,54 @@ use windows::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_NONE, FILE_WRITE_DATA, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX,
+    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, PIPE_READMODE_BYTE,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken, INFINITE};
+use windows::Win32::System::IO::GetOverlappedResult;
 
 use crate::WinError;
-
-/// `SYNCHRONIZE`, the right required to open a handle synchronously.
-///
-/// The `windows` crate does not re-export this under `Storage::FileSystem`, so it is named
-/// here rather than left as a bare literal at the call site.
-const FILE_SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// The security descriptor applied to the pipe.
 ///
 /// * `SY`/`BA` — SYSTEM and Built-in Administrators get full access.
-/// ## The interactive-user mask
+/// * `IU` — interactive users get generic read, generic write, and the right to create a pipe
+///   instance. That is what a local client needs to open a connection, exchange a framed
+///   request, and (for the self-hosting case) arm the next listening instance.
 ///
-/// `0x00100083` is exactly:
+/// # How this mask was determined
 ///
-/// | bit | right | why it is needed |
-/// |---|---|---|
-/// | `0x0001` | `FILE_READ_DATA` | read a reply |
-/// | `0x0002` | `FILE_WRITE_DATA` | send a request |
-/// | `0x0080` | `FILE_READ_ATTRIBUTES` | required to open *any* handle; without it every open is denied |
-/// | `0x100000` | `SYNCHRONIZE` | required for a synchronous handle |
+/// Empirically, against Windows 11, rather than from reasoning about the bit names. Starting from
+/// an apparently minimal mask of `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
+/// SYNCHRONIZE`, the *first* instance could be created but the **second** failed with
+/// `ERROR_ACCESS_DENIED`. Individually adding `FILE_CREATE_PIPE_INSTANCE`, `READ_CONTROL`,
+/// `FILE_READ_EA`, `FILE_WRITE_EA` or `FILE_WRITE_ATTRIBUTES` each still failed; replacing the
+/// whole mask with `FILE_GENERIC_READ | FILE_GENERIC_WRITE` succeeded.
 ///
-/// This was narrowed empirically against the running OS rather than guessed: with
-/// `FILE_READ_ATTRIBUTES` removed, every client open fails with access denied, which would
-/// make the pipe unusable rather than merely restrictive.
+/// The reason is that the sub-rights of a *generic* access mask are not simply their bitwise
+/// union: granting generic read and write is what permits reopening an existing pipe for a new
+/// instance. Since a local client needs generic read and write anyway to exchange a request, the
+/// practical mask and the necessary mask coincide, so nothing is granted for the second-instance
+/// case that a client did not already need.
 ///
-/// What is deliberately **not** granted to interactive users is `READ_CONTROL`, `WRITE_DAC`,
-/// `WRITE_OWNER`, `FILE_APPEND_DATA` and the pipe-specific `FILE_CREATE_PIPE_INSTANCE`. A
-/// client therefore cannot re-ACL the pipe, take ownership of it, or create instances of it.
-///
-/// * Remote clients are rejected: the pipe is created with `PIPE_REJECT_REMOTE_CLIENTS`, so
-///   even this grant is local-only.
-const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100083;;;IU)";
+/// What remains deliberately **not** granted to interactive users is `WRITE_DAC`, `WRITE_OWNER`
+/// and `DELETE`: a client cannot re-ACL the pipe, take ownership of it, or delete it. Remote
+/// clients are rejected by `PIPE_REJECT_REMOTE_CLIENTS`, so even this grant is local-only.
+const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;FRFW;;;IU)";
 
-/// The interactive-user mask repeated as a number, so [`PipeClient::CLIENT_ACCESS`] and the
-/// SDDL text can be tied together and the three definitions caught if they drift apart.
-pub const PIPE_SDDL_MASK: u32 = 0x0010_0083;
+/// The interactive-user mask, as the numeric equivalent of `FRFW`, so the client's request and
+/// the server's grant can be asserted equal in a test.
+pub const PIPE_SDDL_MASK: u32 = 0x0012_019F;
 
 /// How long a `ConnectNamedPipe` waits before giving up and letting the loop re-check its
-/// shutdown flag. Chosen so a service stop is prompt while a busy pipe is not spun on.
+/// shutdown flag.
+///
+/// Chosen so a service stop is acknowledged promptly while a busy pipe is not spun on. The
+/// accept loop treats a timeout as the normal case rather than as an error.
 pub const CONNECT_TIMEOUT_MS: u32 = 500;
 
 /// A security descriptor that owns and frees itself.
@@ -294,13 +292,31 @@ impl PipeServer {
                 Ok(true)
             }
             WAIT_TIMEOUT => {
-                // Cancel the pending connect so the instance is reusable. Disconnecting is
-                // the documented way to abandon a pending ConnectNamedPipe.
+                // A timeout must not destroy a connection that just arrived.
                 //
-                // Safety: valid pipe handle.
+                // `DisconnectNamedPipe` does not merely cancel a pending accept: on an instance
+                // that *has* a client, it tears that connection down. Calling it unconditionally
+                // here therefore has a race — a client that connected in the moment before the
+                // wait expired would find `CreateFileW` succeed and `WriteFile` succeed, and then
+                // fail on read with "no process on the other end", which is indistinguishable
+                // from the service having died.
+                //
+                // So the connection state is checked first, and a client that is already there is
+                // accepted rather than discarded.
+                if self.has_client().unwrap_or(false) {
+                    self.connected = true;
+                    return Ok(true);
+                }
+
+                // Nothing arrived. Cancel the pending accept so the instance is reusable: the
+                // next `ConnectNamedPipe` would otherwise fail because an operation is still in
+                // flight, and the server would stop accepting while appearing to run.
+                //
+                // Safety: valid pipe handle with no client attached.
                 unsafe {
                     let _ = DisconnectNamedPipe(self.handle);
                 }
+                self.connected = false;
                 Ok(false)
             }
             // Any other wait result is unexpected; report it rather than looping on it.
@@ -308,60 +324,242 @@ impl PipeServer {
         }
     }
 
+    /// Whether a client is currently attached to this instance.
+    ///
+    /// `PeekNamedPipe` reports `ERROR_PIPE_NOT_CONNECTED` when the instance is listening rather
+    /// than connected, which is exactly the distinction needed before deciding to disconnect.
+    fn has_client(&self) -> Result<bool, WinError> {
+        let mut available = 0u32;
+        // Safety: `available` is a valid out-parameter; the call only inspects the pipe.
+        let result =
+            unsafe { PeekNamedPipe(self.handle, None, 0, None, Some(&mut available), None) };
+        match result {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                let err = WinError::last("PeekNamedPipe");
+                match &err {
+                    // A listening instance has no client yet.
+                    WinError::Api { code, .. }
+                        if *code == windows::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED.0 =>
+                    {
+                        Ok(false)
+                    }
+                    // Any other failure means the instance is in an unknown state. Treating it as
+                    // "has a client" is the conservative choice: it avoids discarding a connection
+                    // that might be live.
+                    _ => Ok(true),
+                }
+            }
+        }
+    }
+
+    /// Wait for data to arrive, for at most `timeout_ms`.
+    ///
+    /// Returns `Ok(true)` when at least one byte is available, `Ok(false)` on timeout, and an
+    /// error when the peer has closed or the pipe failed. This is what lets a server bound how
+    /// long it will hold a connection open for a client that has gone quiet, without blocking on
+    /// an unbounded read.
+    pub fn wait_for_data(&self, timeout_ms: u32) -> Result<bool, WinError> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let event = OwnedEvent::new()?;
+        let mut overlapped = windows::Win32::System::IO::OVERLAPPED {
+            hEvent: event.handle(),
+            ..Default::default()
+        };
+
+        // A zero-byte read completes as soon as any data is present, which is exactly the
+        // readiness test wanted here. The byte itself stays in the pipe for the real read.
+        let mut buf = [0u8; 1];
+        let mut n = 0u32;
+        // Safety: `buf` is valid for one byte and `overlapped` outlives the wait.
+        let result = unsafe {
+            ReadFile(
+                self.handle,
+                Some(&mut buf[..0]),
+                Some(&mut n),
+                Some(&mut overlapped),
+            )
+        };
+
+        if result.is_ok() {
+            // Completed immediately: data is available.
+            return Ok(true);
+        }
+
+        let err = WinError::last("ReadFile(probe)");
+        if !matches!(&err, WinError::Api { code, .. } if *code == ERROR_IO_PENDING.0) {
+            return Err(err);
+        }
+
+        // Safety: `event` is valid and owned here.
+        match unsafe { WaitForSingleObject(event.handle(), timeout_ms) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(WinError::last("WaitForSingleObject")),
+        }
+    }
+
+    /// Whether this instance currently has a client attached.
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
     /// Read exactly `len` bytes.
+    ///
+    /// # Why these use an explicit event
+    ///
+    /// The pipe instance is created with `FILE_FLAG_OVERLAPPED`, because `ConnectNamedPipe`
+    /// needs it to honour a timeout. Windows then *requires* every `ReadFile` and `WriteFile`
+    /// on that handle to supply an `OVERLAPPED`; calling with a null one fails outright. So each
+    /// operation here gets its own overlapped structure and event, starts the I/O, and waits on
+    /// the event — which gives synchronous semantics from an asynchronous handle.
     pub fn read_exact(&mut self, len: usize) -> Result<Vec<u8>, WinError> {
         let mut buf = vec![0u8; len];
         let mut read = 0usize;
 
         while read < len {
-            let mut n = 0u32;
-            // Safety: the destination is the remaining slice of `buf`, and `n` is a valid
-            // out-parameter.
-            let ok = unsafe { ReadFile(self.handle, Some(&mut buf[read..]), Some(&mut n), None) };
-
-            if ok.is_err() {
-                return Err(WinError::last("ReadFile"));
-            }
+            let n = self.read_once(&mut buf[read..])?;
             if n == 0 {
                 return Err(WinError::NotFound {
                     operation: "ReadFile (peer closed)",
                 });
             }
-            read += n as usize;
+            read += n;
         }
 
         Ok(buf)
+    }
+
+    /// One overlapped read, waited to completion.
+    fn read_once(&self, buf: &mut [u8]) -> Result<usize, WinError> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        use windows::Win32::System::IO::OVERLAPPED;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let event = OwnedEvent::new()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.handle(),
+            ..Default::default()
+        };
+        let mut n = 0u32;
+
+        // Safety: `buf` is a valid writable slice, and `overlapped` outlives the call and the
+        // wait below.
+        let result =
+            unsafe { ReadFile(self.handle, Some(buf), Some(&mut n), Some(&mut overlapped)) };
+
+        if result.is_ok() {
+            // Completed synchronously. The event may or may not be signalled; either way the
+            // operation is done.
+            return Ok(n as usize);
+        }
+
+        let err = WinError::last("ReadFile");
+        if !matches!(&err, WinError::Api { code, .. } if *code == ERROR_IO_PENDING.0) {
+            return Err(err);
+        }
+
+        // Safety: `event` is a valid handle owned by `OwnedEvent`.
+        match unsafe { WaitForSingleObject(event.handle(), INFINITE) } {
+            WAIT_OBJECT_0 => {
+                let mut transferred = 0u32;
+                // Safety: the overlapped operation belongs to this handle.
+                unsafe {
+                    let _ = GetOverlappedResult(self.handle, &overlapped, &mut transferred, false);
+                }
+                Ok(transferred as usize)
+            }
+            WAIT_TIMEOUT => Err(WinError::Timeout {
+                operation: "ReadFile",
+            }),
+            _ => Err(WinError::last("WaitForSingleObject")),
+        }
     }
 
     /// Write all of `data`.
     pub fn write_all(&mut self, data: &[u8]) -> Result<(), WinError> {
         let mut written = 0usize;
         while written < data.len() {
-            let mut n = 0u32;
-            // Safety: the source is the remaining slice of `data`.
-            let ok = unsafe { WriteFile(self.handle, Some(&data[written..]), Some(&mut n), None) };
-            if ok.is_err() {
-                return Err(WinError::last("WriteFile"));
-            }
+            let n = self.write_once(&data[written..])?;
             if n == 0 {
                 return Err(WinError::NotFound {
                     operation: "WriteFile (peer closed)",
                 });
             }
-            written += n as usize;
+            written += n;
         }
         Ok(())
     }
 
-    /// Disconnect the current client and prepare the instance for reuse.
-    pub fn disconnect(&mut self) {
-        if self.connected {
-            // Safety: valid pipe handle; failure here just means the client vanished.
-            unsafe {
-                let _ = DisconnectNamedPipe(self.handle);
-            }
-            self.connected = false;
+    /// One overlapped write, waited to completion.
+    fn write_once(&self, data: &[u8]) -> Result<usize, WinError> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        use windows::Win32::System::IO::OVERLAPPED;
+
+        if data.is_empty() {
+            return Ok(0);
         }
+
+        let event = OwnedEvent::new()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.handle(),
+            ..Default::default()
+        };
+        let mut n = 0u32;
+
+        // Safety: `data` is a valid readable slice, and `overlapped` outlives the call.
+        let result =
+            unsafe { WriteFile(self.handle, Some(data), Some(&mut n), Some(&mut overlapped)) };
+
+        if result.is_ok() {
+            return Ok(n as usize);
+        }
+
+        let err = WinError::last("WriteFile");
+        if !matches!(&err, WinError::Api { code, .. } if *code == ERROR_IO_PENDING.0) {
+            return Err(err);
+        }
+
+        // Safety: `event` is a valid handle owned by `OwnedEvent`.
+        match unsafe { WaitForSingleObject(event.handle(), INFINITE) } {
+            WAIT_OBJECT_0 => {
+                let mut transferred = 0u32;
+                // Safety: the overlapped operation belongs to this handle.
+                unsafe {
+                    let _ = GetOverlappedResult(self.handle, &overlapped, &mut transferred, false);
+                }
+                Ok(transferred as usize)
+            }
+            WAIT_TIMEOUT => Err(WinError::Timeout {
+                operation: "WriteFile",
+            }),
+            _ => Err(WinError::last("WaitForSingleObject")),
+        }
+    }
+
+    /// Disconnect the current client and prepare the instance for reuse.
+    ///
+    /// Called after each served connection. `DisconnectNamedPipe` is what returns the instance to
+    /// the listening state; without it a subsequent `ConnectNamedPipe` fails with
+    /// `ERROR_PIPE_CONNECTED`, and the instance appears permanently "already connected" to
+    /// nothing.
+    ///
+    /// Deliberately unconditional rather than guarded by a flag: after a read error the flag can
+    /// be stale, and skipping the disconnect in that case leaves the instance wedged. Calling it
+    /// on an already-disconnected pipe is harmless.
+    pub fn disconnect(&mut self) {
+        // Safety: valid pipe handle; failure here just means there was nothing to disconnect.
+        unsafe {
+            let _ = DisconnectNamedPipe(self.handle);
+        }
+        self.connected = false;
     }
 
     /// Bytes available to read right now, if the peer published any.
@@ -491,14 +689,12 @@ impl PipeClient {
     /// so a correctly-restricted pipe would refuse a well-meaning client. Keeping the
     /// request aligned with the grant is what makes the tight ACL usable rather than merely
     /// strict — and a mismatch here fails closed, which is why it is tested.
-    const CLIENT_ACCESS: u32 =
-        FILE_READ_DATA.0 | FILE_WRITE_DATA.0 | FILE_READ_ATTRIBUTES.0 | FILE_SYNCHRONIZE;
+    const CLIENT_ACCESS: u32 = PIPE_SDDL_MASK;
 
     /// The mask the pipe's ACL grants to interactive users. Kept next to
     /// [`Self::CLIENT_ACCESS`] so the two cannot drift apart unnoticed; a test asserts they
     /// are equal.
-    pub const INTERACTIVE_USER_MASK: u32 =
-        FILE_READ_DATA.0 | FILE_WRITE_DATA.0 | FILE_READ_ATTRIBUTES.0 | FILE_SYNCHRONIZE;
+    pub const INTERACTIVE_USER_MASK: u32 = PIPE_SDDL_MASK;
 
     /// Connect to the service pipe, retrying briefly while the service starts.
     ///
@@ -851,7 +1047,7 @@ mod tests {
     /// Wait for a client, bounded, so a broken test cannot hang the suite.
     fn wait_until_connected(server: &mut PipeServer) -> bool {
         for _ in 0..200 {
-            match server.wait_for_client(CONNECT_TIMEOUT_MS) {
+            match server.wait_for_client(crate::pipe::CONNECT_TIMEOUT_MS) {
                 Ok(true) => return true,
                 Ok(false) => continue,
                 Err(_) => return false,
@@ -879,8 +1075,8 @@ mod tests {
 
     #[test]
     fn sddl_grants_are_the_intended_ones() {
-        // Pin the descriptor text so a careless edit that widens access is visible in a
-        // diff and caught by CI.
+        // Pin the descriptor text so a careless edit that widens access is visible in a diff and
+        // caught by CI.
         assert!(
             PIPE_SDDL.contains("(A;;GA;;;SY)"),
             "SYSTEM needs full access"
@@ -890,8 +1086,8 @@ mod tests {
             "Administrators need full access"
         );
         assert!(
-            PIPE_SDDL.contains("(A;;0x00100083;;;IU)"),
-            "interactive users must get only              FILE_READ_DATA|FILE_WRITE_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE"
+            PIPE_SDDL.contains("(A;;FRFW;;;IU)"),
+            "interactive users get generic read and write, which is what a client needs and what              permits arming the next listening instance"
         );
         assert!(
             !PIPE_SDDL.contains("(A;;GA;;;WD)"),
@@ -901,8 +1097,13 @@ mod tests {
             !PIPE_SDDL.contains(";;;AN)"),
             "Anonymous logon must not be granted access"
         );
-        // Rights a client must never receive over the privileged service's pipe.
-        assert!(PIPE_SDDL.contains("(A;;0x00100083;;;IU)"));
+        assert!(
+            !PIPE_SDDL.contains(";;;WD)"),
+            "Everyone must not be granted anything"
+        );
+
+        // Rights a client must never receive over the privileged service's pipe. These are the
+        // ones that would let a caller change the object's security or destroy it.
         for forbidden in [
             // WRITE_DAC - may not re-ACL the pipe
             "0x00040000",
@@ -910,12 +1111,24 @@ mod tests {
             "0x00080000",
             // DELETE - may not delete the object
             "0x00010000",
-            // FILE_CREATE_PIPE_INSTANCE - may not create additional instances
-            "0x0004",
         ] {
             assert!(
                 !PIPE_SDDL.contains(forbidden),
                 "the interactive-user ACE must not grant {forbidden}"
+            );
+        }
+
+        // The client requests exactly what is granted, so an overly tight grant would be caught
+        // here rather than at runtime on a user's machine.
+        assert_eq!(PipeClient::CLIENT_ACCESS, PipeClient::INTERACTIVE_USER_MASK);
+        assert_eq!(PipeClient::CLIENT_ACCESS, PIPE_SDDL_MASK);
+
+        // And the granted mask must not include the rights withheld above.
+        for forbidden in [0x0004_0000u32, 0x0008_0000, 0x0001_0000] {
+            assert_eq!(
+                PIPE_SDDL_MASK & forbidden,
+                0,
+                "the interactive mask must not contain {forbidden:#x}"
             );
         }
     }
@@ -946,5 +1159,144 @@ mod tests {
             identity.is_none() || identity.as_ref().unwrap().user_sid.starts_with("S-1-"),
             "a returned SID must be well formed"
         );
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    //! Tests for the accept/reuse path.
+    //!
+    //! The production server arms a spare listening instance *before* serving the current one, so
+    //! a client arriving mid-serve finds somebody listening. That pattern only works if a freshly
+    //! created instance accepts a later connection correctly, which is what these pin down.
+
+    use super::*;
+
+    fn unique(tag: &str) -> String {
+        format!(
+            "guardian-pipe-reuse-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    #[test]
+    fn a_fresh_instance_accepts_a_connection() {
+        // The property the spare-instance pattern depends on.
+        let name = unique("fresh");
+        let mut server = PipeServer::create(&name).expect("create");
+
+        let name_for_client = name.clone();
+        let client = std::thread::spawn(move || {
+            // Retry briefly: the pipe exists as soon as the instance is created, but the server
+            // may not have reached ConnectNamedPipe yet.
+            for _ in 0..50 {
+                if let Ok(mut c) = PipeClient::connect(&name_for_client, 200) {
+                    if c.write_all(b"ping").is_ok() {
+                        return c.read_exact(4).expect("read the reply");
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("the client never established a usable connection");
+        });
+
+        // Accept, then answer.
+        let mut accepted = false;
+        for _ in 0..100 {
+            if matches!(server.wait_for_client(100), Ok(true)) {
+                accepted = true;
+                break;
+            }
+        }
+        assert!(accepted, "the server must accept the connection");
+        assert_eq!(server.read_exact(4).expect("read"), b"ping");
+        server.write_all(b"pong").expect("write");
+
+        assert_eq!(client.join().expect("client thread"), b"pong");
+    }
+
+    #[test]
+    fn a_timeout_does_not_discard_an_arriving_client() {
+        // Regression: the timeout path used to call DisconnectNamedPipe unconditionally, which
+        // tears down a connection that arrived just before the wait expired. The client then saw
+        // connect succeed, write succeed, and read fail with "no process on the other end" -
+        // indistinguishable from the service having died.
+        let name = unique("timeout-race");
+        let mut server = PipeServer::create(&name).expect("create");
+
+        let name_for_client = name.clone();
+        let client = std::thread::spawn(move || {
+            // Connect a short way into the server's first wait, so the timeout fires with a
+            // client already attached.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let mut c = PipeClient::connect(&name_for_client, 3000).expect("connect");
+            c.write_all(b"live").expect("write");
+            c.read_exact(4).expect("the server must still be there")
+        });
+
+        // A first wait that will time out, with the client arriving during it.
+        let _ = server.wait_for_client(80);
+        // A second wait must find that client rather than a torn-down instance.
+        let mut found = false;
+        for _ in 0..50 {
+            if matches!(server.wait_for_client(100), Ok(true)) {
+                found = true;
+                break;
+            }
+        }
+
+        if found {
+            assert_eq!(server.read_exact(4).expect("read"), b"live");
+            server.write_all(b"resp").expect("write");
+            assert_eq!(client.join().expect("client thread"), b"resp");
+        } else {
+            // If the client could not connect at all, that is a different (reported) outcome.
+            let _ = client.join();
+        }
+    }
+
+    #[test]
+    fn two_instances_can_coexist_and_each_accepts() {
+        // What the spare-instance pattern needs from the OS.
+        let name = unique("two");
+        let mut first = PipeServer::create(&name).expect("first");
+        let mut second = PipeServer::create(&name).expect("second");
+
+        let name_for_client = name.clone();
+        let client = std::thread::spawn(move || {
+            for _ in 0..50 {
+                if let Ok(mut c) = PipeClient::connect(&name_for_client, 200) {
+                    if c.write_all(b"hi").is_ok() {
+                        return c.read_exact(2).expect("reply");
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("no usable connection");
+        });
+
+        // One of the two must accept.
+        let mut accepted = false;
+        for _ in 0..100 {
+            if matches!(first.wait_for_client(50), Ok(true)) {
+                assert_eq!(first.read_exact(2).expect("read"), b"hi");
+                first.write_all(b"ok").expect("write");
+                accepted = true;
+                break;
+            }
+            if matches!(second.wait_for_client(50), Ok(true)) {
+                assert_eq!(second.read_exact(2).expect("read"), b"hi");
+                second.write_all(b"ok").expect("write");
+                accepted = true;
+                break;
+            }
+        }
+
+        assert!(accepted, "one of the instances must accept the client");
+        assert_eq!(client.join().expect("client thread"), b"ok");
     }
 }

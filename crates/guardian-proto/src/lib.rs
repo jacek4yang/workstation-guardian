@@ -234,18 +234,103 @@ pub enum Response {
         /// Server time (UTC) so clients can render relative ages without clock skew.
         server_time: i64,
     },
-    Status(Box<StatusSnapshot>),
-    Agents(Box<AgentInventory>),
-    Incidents(Vec<Incident>),
-    Network(Box<NetworkSnapshot>),
-    PendingReboot(Box<PendingRebootReport>),
-    Config(Box<ConfigDocument>),
-    Health(Box<HealthReport>),
-    RebootAuthorization(Box<Option<RebootAuthorization>>),
+    // Every variant is a struct variant carrying named fields. This is not stylistic: the enum is
+    // internally tagged (`tag = "kind"`), and serde cannot serialize a newtype variant whose
+    // payload is not a map. `Incidents(Vec<Incident>)` in particular failed at runtime, which
+    // meant that response could never be sent at all.
+    Status {
+        snapshot: Box<StatusSnapshot>,
+    },
+    Agents {
+        inventory: Box<AgentInventory>,
+    },
+    Incidents {
+        incidents: Vec<Incident>,
+    },
+    Network {
+        snapshot: Box<NetworkSnapshot>,
+    },
+    PendingReboot {
+        report: Box<PendingRebootReport>,
+    },
+    Config {
+        config: Box<ConfigDocument>,
+    },
+    Health {
+        report: Box<HealthReport>,
+    },
+    RebootAuthorization {
+        authorization: Box<Option<RebootAuthorization>>,
+    },
     Ok {
         message: String,
     },
-    Error(ProtocolError),
+    /// A protocol error.
+    ///
+    /// A struct variant rather than a newtype: this enum is internally tagged (`tag = "kind"`),
+    /// and serde cannot deserialize an internally-tagged newtype variant whose payload is itself
+    /// an internally-tagged enum. Boxing keeps the enum small while satisfying that constraint.
+    Error {
+        error: Box<ProtocolError>,
+    },
+}
+
+impl Response {
+    pub fn status(snapshot: StatusSnapshot) -> Self {
+        Response::Status {
+            snapshot: Box::new(snapshot),
+        }
+    }
+
+    pub fn agents(inventory: AgentInventory) -> Self {
+        Response::Agents {
+            inventory: Box::new(inventory),
+        }
+    }
+
+    pub fn incidents(incidents: Vec<Incident>) -> Self {
+        Response::Incidents { incidents }
+    }
+
+    pub fn network(snapshot: NetworkSnapshot) -> Self {
+        Response::Network {
+            snapshot: Box::new(snapshot),
+        }
+    }
+
+    pub fn pending_reboot(report: PendingRebootReport) -> Self {
+        Response::PendingReboot {
+            report: Box::new(report),
+        }
+    }
+
+    pub fn config(config: ConfigDocument) -> Self {
+        Response::Config {
+            config: Box::new(config),
+        }
+    }
+
+    pub fn health(report: HealthReport) -> Self {
+        Response::Health {
+            report: Box::new(report),
+        }
+    }
+
+    pub fn reboot_authorization(authorization: Option<RebootAuthorization>) -> Self {
+        Response::RebootAuthorization {
+            authorization: Box::new(authorization),
+        }
+    }
+
+    /// Build an error response.
+    ///
+    /// The variant carries a boxed error rather than a bare one for serialization reasons (this
+    /// enum is internally tagged), so construction goes through here and call sites stay readable.
+    pub fn error(error: ProtocolError) -> Self {
+        Response::Error {
+            error: Box::new(error),
+        }
+    }
 }
 
 /// A protocol-level error. Distinct from transport errors.
@@ -262,14 +347,40 @@ pub enum ProtocolError {
         actual: Principal,
     },
 
-    #[error("invalid request: {0}")]
-    InvalidRequest(String),
+    // The remaining variants are struct variants rather than newtypes because this enum is
+    // internally tagged (`tag = "code"`), and serde cannot serialize an internally-tagged newtype
+    // variant whose payload is a bare string. A struct variant makes the encoding unambiguous.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
 
-    #[error("operation refused: {0}")]
-    Refused(String),
+    #[error("operation refused: {message}")]
+    Refused { message: String },
 
-    #[error("internal error: {0}")]
-    Internal(String),
+    #[error("internal error: {message}")]
+    Internal { message: String },
+}
+
+impl ProtocolError {
+    /// Build an invalid-request error.
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        ProtocolError::InvalidRequest {
+            message: message.into(),
+        }
+    }
+
+    /// Build a refusal.
+    pub fn refused(message: impl Into<String>) -> Self {
+        ProtocolError::Refused {
+            message: message.into(),
+        }
+    }
+
+    /// Build an internal error.
+    pub fn internal(message: impl Into<String>) -> Self {
+        ProtocolError::Internal {
+            message: message.into(),
+        }
+    }
 }
 
 #[cfg(test)]

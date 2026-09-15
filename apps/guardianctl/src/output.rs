@@ -18,17 +18,17 @@ pub fn render_response(response: &Response) -> String {
             service_version,
             ..
         } => format!("service version {service_version} (protocol {protocol})"),
-        Response::Status(s) => status_text(s),
-        Response::Agents(a) => agents_text(a),
-        Response::Network(n) => network_text(n),
-        Response::Incidents(v) => incidents_text(v),
-        Response::PendingReboot(p) => pending_reboot_text(p),
-        Response::Config(c) => match serde_json::to_string_pretty(c) {
+        Response::Status { snapshot: s } => status_text(s),
+        Response::Agents { inventory } => agents_text(inventory),
+        Response::Network { snapshot } => network_text(snapshot),
+        Response::Incidents { incidents } => incidents_text(incidents),
+        Response::PendingReboot { report: p } => pending_reboot_text(p),
+        Response::Config { config: c } => match serde_json::to_string_pretty(c) {
             Ok(s) => s,
             Err(e) => format!("could not render the configuration: {e}"),
         },
-        Response::Health(h) => crate::doctor::render(h),
-        Response::RebootAuthorization(a) => match a.as_ref() {
+        Response::Health { report: h } => crate::doctor::render(h),
+        Response::RebootAuthorization { authorization: a } => match a.as_ref() {
             Some(auth) => format!(
                 "A single reboot is authorized.\n  Issued at    {}\n  Expires at   {}\n  Issued by    {}\n  Consumed     {}",
                 format_ms(auth.issued_at_ms),
@@ -41,7 +41,7 @@ pub fn render_response(response: &Response) -> String {
             None => "No reboot is authorized.".to_string(),
         },
         Response::Ok { message } => message.clone(),
-        Response::Error(e) => format!("error: {e}"),
+        Response::Error { error } => format!("error: {error}"),
     }
 }
 
@@ -917,20 +917,20 @@ mod tests {
                 service_version: "0.1.0".into(),
                 server_time: 0,
             },
-            Response::Status(Box::new(sample_status())),
-            Response::Agents(Box::default()),
-            Response::Network(Box::default()),
-            Response::Incidents(vec![]),
-            Response::PendingReboot(Box::new(PendingRebootReport {
+            Response::status(sample_status()),
+            Response::agents(AgentInventory::default()),
+            Response::network(NetworkSnapshot::default()),
+            Response::incidents(vec![]),
+            Response::pending_reboot(PendingRebootReport {
                 verdict: PendingRebootVerdict::NotPending,
                 signals: vec![],
                 checked_at_ms: 0,
-            })),
-            Response::RebootAuthorization(Box::new(None)),
+            }),
+            Response::reboot_authorization(None),
             Response::Ok {
                 message: "done".into(),
             },
-            Response::Error(guardian_proto::ProtocolError::Refused("no".into())),
+            Response::error(guardian_proto::ProtocolError::refused("no")),
         ];
 
         for r in responses {

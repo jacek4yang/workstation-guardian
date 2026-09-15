@@ -95,7 +95,7 @@ fn run_session(blocker: &mut ShutdownBlocker, _running: Arc<AtomicBool>) -> Resu
                 client: SubscriberKind::SessionHelper,
             },
             |response| match response {
-                Response::Status(snapshot) => {
+                Response::Status { snapshot } => {
                     apply_state(blocker, snapshot.mode);
                     true
                 }
