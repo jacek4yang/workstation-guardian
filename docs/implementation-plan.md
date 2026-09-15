@@ -45,15 +45,26 @@ Completed subsystems, each committed with its tests green:
 5. **guardian-network** — connectivity probes by quorum, the RAS/Wi-Fi backend, and the worker
    loop that implements "broadband primary, Wi-Fi continuity, repair in parallel".
 
-## Remaining
+6. **guardian-update** — verification loop, tamper detection, incident recording.
+7. **guardian-service** — supervisor with per-worker restart, state coordinator, IPC server,
+   recovery journal, preshutdown handling, bounded structured logging.
+8. **guardian-session** — the per-user shutdown blocker.
+9. **guardianctl** — diagnostics, SCM control, installation and uninstallation.
+10. **guardian-ui** — Tauri v2 tray and control panel.
+11. **Documentation** — README plus seven documents under `docs/`.
+12. **CI and packaging** — GitHub Actions on Windows, and a redistributable archive.
 
-6. guardian-update worker (scheduled verification + tamper incidents)
-7. guardian-service: SCM lifecycle, supervisor, IPC server, preshutdown, recovery journal
-8. guardian-session: per-user shutdown blocker
-9. guardianctl: diagnostics
-10. guardian-ui: Tauri v2 tray and control panel
-11. Installer/uninstaller
-12. Documentation and final real-machine validation
+## Status: shipped
+
+Released as [v0.1.0](https://github.com/jacek4yang/workstation-guardian/releases/tag/v0.1.0).
+
+Verified on this workstation (Windows 11 Pro 10.0.26200): update protection reads `Protected`
+with zero registry writes on a conformant machine; the detector reports exactly the five running
+agents Windows reports, with their real project names and no false positives; the PPPoE entry
+`宽带连接` is enumerated and auto-selected; connectivity is judged by quorum across four probes on
+a network that filters direct connections to public resolver IPs.
+
+595 tests pass with no clippy warnings.
 
 ## Findings worth remembering
 
@@ -67,3 +78,24 @@ Real behaviour discovered by running tests against the OS rather than reasoning 
 * RAS error text is localized by the OS, so tests must not assert English words from that path.
 * An npm-launched agent appears as two matching processes; a launcher that has an
   at-least-as-strong matched descendant must be suppressed or every such agent counts twice.
+
+## Defects found by running against the real machine
+
+Recorded because they justify the insistence on real-machine validation. None of these were
+visible by reading the code, and several would have shipped.
+
+| Defect | How it surfaced |
+|---|---|
+| The pipe ACL was unusable rather than tight — every client open was denied | An actual client connecting |
+| `ConnectNamedPipe` ignores timeouts on a blocking pipe, so a stop could hang | A test that hung |
+| `REG_MULTI_SZ` decoding truncated at the first element | Registry round-trip |
+| MDM reported a managed machine that was not managed | `guardianctl update` on this workstation |
+| Absent deadline policies were flagged *and* written every pass | The same run |
+| `Response` could not serialize `Incidents` at all | A real IPC round trip |
+| The accept timeout destroyed arriving connections | A sequential-request test |
+| A second pipe instance could not be created without elevation | Bisecting an access-denied failure |
+| `OpenEventLogW` silently opens a *different* log for a bogus channel | A channel-existence test |
+| "Has a console" is not a valid service check | A test run with no console |
+| A freshly dialled link was torn down and re-dialled forever on a filtered network | Running against this campus network |
+| Backoff reset on every attempt, producing a dial loop | The same run |
+| Log pruning could delete the live log | A bounds test |
