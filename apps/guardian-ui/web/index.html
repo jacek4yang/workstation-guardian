@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Workstation Guardian</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!--
+    The panel is deliberately restrained: it reports state and offers the few operations that
+    matter. There is no dashboard, no chart, and nothing that animates. An operator opens this to
+    answer "is my work protected, and if not, why", and it should answer that immediately.
+  -->
+  <header>
+    <h1>Workstation Guardian</h1>
+    <p id="subtitle" class="muted">Connecting to the service…</p>
+  </header>
+
+  <div id="error" class="banner error" hidden></div>
+
+  <section aria-labelledby="protection-heading">
+    <h2 id="protection-heading">Protection</h2>
+    <dl class="rows">
+      <div class="row"><dt>Update protection</dt><dd id="update-level" class="level">—</dd></div>
+      <div class="row"><dt>Restart protection</dt><dd id="restart-level" class="level">—</dd></div>
+      <div class="row"><dt>Mode</dt><dd id="mode">—</dd></div>
+      <div class="row"><dt>Service</dt><dd id="service">—</dd></div>
+      <div class="row"><dt>Uptime</dt><dd id="uptime">—</dd></div>
+      <div class="row" id="degraded-row" hidden><dt>Degraded</dt><dd id="degraded"></dd></div>
+      <div class="row" id="pending-row"><dt>Pending reboot</dt><dd id="pending">—</dd></div>
+    </dl>
+    <details id="update-detail">
+      <summary>Update policy detail</summary>
+      <ul id="policy-values"></ul>
+      <ul id="update-findings"></ul>
+    </details>
+  </section>
+
+  <section aria-labelledby="network-heading">
+    <h2 id="network-heading">Network</h2>
+    <dl class="rows">
+      <div class="row"><dt>Internet</dt><dd id="internet">—</dd></div>
+      <div class="row"><dt>PPPoE entry</dt><dd id="entry">—</dd></div>
+      <div class="row"><dt>Connection uptime</dt><dd id="net-uptime">—</dd></div>
+      <div class="row" id="outage-row" hidden><dt>Outage</dt><dd id="outage"></dd></div>
+    </dl>
+    <button id="reconnect">Reconnect Internet</button>
+    <details id="net-detail">
+      <summary>Connectivity probes</summary>
+      <ul id="probes"></ul>
+    </details>
+  </section>
+
+  <section aria-labelledby="work-heading">
+    <h2 id="work-heading">Active work</h2>
+    <div id="agents-empty" class="muted" hidden>Nothing detected.</div>
+    <table id="agents-table" hidden>
+      <thead>
+        <tr><th>Agent</th><th>Confidence</th><th>PID</th><th>Project</th><th>Resumable</th></tr>
+      </thead>
+      <tbody id="agents-body"></tbody>
+    </table>
+    <div id="workloads" hidden>
+      <h3>Protected builds</h3>
+      <ul id="workloads-list"></ul>
+    </div>
+    <div id="candidates" hidden>
+      <h3>Unconfirmed candidates</h3>
+      <p class="muted small">
+        These matched some agent evidence but not enough to be trusted. They are reported for
+        information and never block a shutdown.
+      </p>
+      <ul id="candidates-list"></ul>
+    </div>
+  </section>
+
+  <section aria-labelledby="maintenance-heading">
+    <h2 id="maintenance-heading">Maintenance</h2>
+    <div id="maintenance-locked">
+      <p class="muted small">
+        Entering maintenance mode unlocks Windows Update so it can install. Guardian will still
+        never authorize an automatic restart on your behalf.
+      </p>
+      <div id="blockers" hidden>
+        <p class="warn">Protected work is running:</p>
+        <ul id="blockers-list"></ul>
+      </div>
+      <button id="enter-maintenance">Enter Maintenance Mode…</button>
+    </div>
+
+    <div id="maintenance-active" hidden>
+      <p class="warn">
+        Updates are unlocked. Windows Update may install while you are in this mode.
+      </p>
+      <dl class="rows">
+        <div class="row"><dt>Reboot authorization</dt><dd id="reboot-auth">none</dd></div>
+      </dl>
+      <button id="arm-reboot">Allow One Reboot</button>
+      <button id="disarm-reboot">Revoke Reboot Authorization</button>
+      <button id="exit-maintenance">Exit Maintenance and Lock Updates</button>
+    </div>
+  </section>
+
+  <section aria-labelledby="incidents-heading">
+    <h2 id="incidents-heading">Incidents</h2>
+    <div id="incidents-empty" class="muted" hidden>No incidents recorded.</div>
+    <ul id="incidents-list"></ul>
+  </section>
+
+  <footer>
+    <button id="refresh">Refresh</button>
+    <button id="exit-ui" class="secondary">Exit UI</button>
+    <p class="muted small">
+      Exiting the UI does not stop protection. The service keeps running.
+    </p>
+  </footer>
+
+  <!-- A confirmation dialog for the actions that unlock protection. Built here rather than with a
+       popup window so the workflow stays inside the panel. -->
+  <dialog id="confirm-dialog">
+    <h3 id="confirm-title">Confirm</h3>
+    <p id="confirm-body"></p>
+    <label id="confirm-phrase-row" hidden>
+      Type <code id="confirm-phrase"></code> to continue:
+      <input id="confirm-input" type="text" autocomplete="off" />
+    </label>
+    <menu>
+      <button id="confirm-cancel" class="secondary">Cancel</button>
+      <button id="confirm-ok">Confirm</button>
+    </menu>
+  </dialog>
+
+  <script src="main.js"></script>
+</body>
+</html>

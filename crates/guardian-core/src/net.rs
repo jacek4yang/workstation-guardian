@@ -654,11 +654,39 @@ pub fn evaluate(
     // Evaluated *first* and unconditionally. Nothing below may take the machine offline,
     // so the backup path is established before any broadband repair is considered.
 
-    let broadband_usable = obs.ras_connected
-        && obs.broadband_has_ip
-        && obs.broadband_default_route
-        && obs.total() > 0
-        && obs.quorum_ok(policy.failure_quorum);
+    // Broadband health, in two tiers.
+    //
+    // The *link* is up when the session exists, has an address, and has a default route. That is
+    // evidence from the interface and routing layers, which cannot be confused by a filtered
+    // network.
+    //
+    // The *path* is proven when a quorum of probes also succeeds. On a network that blocks direct
+    // connections to public resolver IPs - a campus or corporate connection, for example - probes
+    // can fail while the link is genuinely fine.
+    //
+    // Conflating the two caused a real defect: a link that dialled successfully would fail its
+    // probe quorum, be declared unusable, be torn down, and be dialled again - an endless dial
+    // loop that looked like a broken ISP. So a *freshly established* link is judged on link
+    // evidence alone until it has had a chance to be verified, and probe failures only demote a
+    // link that was previously proven healthy.
+    let link_up = obs.ras_connected && obs.broadband_has_ip && obs.broadband_default_route;
+    let probes_prove_path = obs.total() == 0 || obs.quorum_ok(policy.failure_quorum);
+    let link_proven = link_up && probes_prove_path;
+
+    // While a link is still being verified, unproven probes are not treated as failure: the
+    // verification window exists precisely to give a new link time to settle.
+    let settling = matches!(
+        state.broadband,
+        BroadbandState::Verifying | BroadbandState::Connecting | BroadbandState::Authenticating
+    );
+
+    let broadband_usable = if settling {
+        link_up
+    } else {
+        // An established link must keep passing its probes; that is what detects a path that has
+        // genuinely stopped working while the session stayed up.
+        link_proven
+    };
 
     if policy.wifi_enabled {
         update_wifi(
@@ -722,9 +750,17 @@ pub fn evaluate(
             }
             _ => {
                 // Entering verification from any other state, including a fresh dial.
+                //
+                // The backoff is deliberately NOT reset here. A connection that comes up and then
+                // dies immediately - a half-dead PPPoE session, for example, where RAS reports the
+                // session as established while the underlying link is gone - would otherwise reset
+                // the schedule on every attempt and redial at the initial interval forever. That
+                // is a dial loop, and against a real ISP it is indistinguishable from an attack.
+                //
+                // Verification is not success. Only reaching `Healthy` counts, and that is where
+                // the schedule is reset.
                 s.broadband = BroadbandState::Verifying;
                 s.broadband_healthy_since_ms = Some(now_ms);
-                s.backoff_index = 0;
                 notes.push("broadband connected; verifying stability before switching back".into());
             }
         }
@@ -1378,6 +1414,362 @@ pub fn ras_error_message(code: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_that_dies_right_after_dialling_still_backs_off() {
+        use crate::net::*;
+
+        // Regression, found on a real network with a half-dead PPPoE session: RAS reported the session
+        // as established, the link then vanished immediately, and the state machine reset its backoff
+        // on every attempt. The result was a dial loop at the initial interval forever - against a real
+        // ISP that is indistinguishable from an attack, and it also flooded the log.
+        //
+        // Verification is not success. Only a link that reaches Healthy may reset the schedule.
+        let policy = NetworkPolicy {
+            failure_quorum: 1,
+            min_dial_interval_secs: 0,
+            ..Default::default()
+        };
+
+        // The link comes up with an address and a route, then disappears before the next round.
+        let up = NetworkObservation {
+            ras_connected: true,
+            broadband_has_ip: true,
+            broadband_default_route: true,
+            probe_results: vec![ProbeOutcome {
+                id: "p".into(),
+                kind: ProbeKind::Tcp,
+                ok: true,
+                latency_ms: Some(5),
+                error: None,
+            }],
+            ..Default::default()
+        };
+        let gone = NetworkObservation {
+            ras_connected: false,
+            ..Default::default()
+        };
+
+        let mut state = NetworkState::default();
+        let mut backoffs = Vec::new();
+
+        // Alternate: dial succeeds, link dies, repeat. Each cycle is two evaluations.
+        let mut now = 10_000;
+        for _ in 0..6 {
+            now += 1_000;
+            let t = evaluate(&state, &up, &policy, now);
+            state = t.state;
+
+            now += 1_000;
+            let t = evaluate(&state, &gone, &policy, now);
+            state = t.state;
+            backoffs.push(state.backoff_index);
+        }
+
+        assert!(
+            backoffs.last().copied().unwrap_or(0) > 0,
+            "the backoff index must advance across repeated abort cycles, got {backoffs:?}"
+        );
+        assert!(
+            backoffs.windows(2).any(|w| w[1] > w[0]),
+            "the schedule must grow rather than resetting every cycle, got {backoffs:?}"
+        );
+    }
+
+    #[test]
+    fn the_backoff_resets_only_after_a_link_is_genuinely_healthy() {
+        use crate::net::*;
+
+        let policy = NetworkPolicy {
+            failure_quorum: 1,
+            stabilize_secs: 5,
+            min_dial_interval_secs: 0,
+            ..Default::default()
+        };
+
+        let healthy = NetworkObservation {
+            ras_connected: true,
+            broadband_has_ip: true,
+            broadband_default_route: true,
+            wifi_connected: true,
+            wifi_has_ip: true,
+            probe_results: vec![ProbeOutcome {
+                id: "p".into(),
+                kind: ProbeKind::Tcp,
+                ok: true,
+                latency_ms: Some(5),
+                error: None,
+            }],
+            ..Default::default()
+        };
+
+        // Start with a well-advanced schedule, as if the link had failed many times.
+        let mut state = NetworkState {
+            broadband: BroadbandState::Reconnecting,
+            backoff_index: 5,
+            dial_attempts: 7,
+            ..Default::default()
+        };
+
+        // Long enough to clear the stabilization window and be promoted.
+        for round in 0..40 {
+            let t = evaluate(&state, &healthy, &policy, 1_000 + round * 2_000);
+            state = t.state;
+        }
+
+        assert_eq!(
+            state.broadband,
+            BroadbandState::Healthy,
+            "the link should have been promoted after stabilizing"
+        );
+        assert_eq!(
+            state.backoff_index, 0,
+            "reaching Healthy is what resets the schedule"
+        );
+        assert_eq!(state.dial_attempts, 0);
+    }
+
+    #[test]
+    fn a_freshly_dialled_link_is_not_torn_down_because_probes_fail() {
+        use crate::net::*;
+
+        // Regression, found on a real campus network: egress to public resolver IPs was blocked, so
+        // the probe quorum never passed even with a healthy PPPoE session. The state machine treated
+        // that as "session up but useless", hung it up, dialled again, and looped forever - which
+        // looked like a broken ISP and, worse, meant the link was never usable.
+        //
+        // Link-layer evidence (session up, address, default route) is what establishes that broadband
+        // is up. Probe evidence is what proves the *path* is good, and it must not be applied to a link
+        // that has not finished settling.
+        let policy = NetworkPolicy::default();
+
+        // Session up with an address and a route, but every probe fails because the network filters
+        // direct connections to public IPs.
+        let obs = NetworkObservation {
+            ras_connected: true,
+            broadband_has_ip: true,
+            broadband_default_route: true,
+            wifi_connected: true,
+            wifi_has_ip: true,
+            probe_results: vec![
+                ProbeOutcome {
+                    id: "a".into(),
+                    kind: ProbeKind::Tcp,
+                    ok: false,
+                    latency_ms: None,
+                    error: None,
+                },
+                ProbeOutcome {
+                    id: "b".into(),
+                    kind: ProbeKind::Tcp,
+                    ok: false,
+                    latency_ms: None,
+                    error: None,
+                },
+                ProbeOutcome {
+                    id: "c".into(),
+                    kind: ProbeKind::Dns,
+                    ok: true,
+                    latency_ms: Some(4),
+                    error: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Start from a fresh dial: the state right after a successful RasDialW.
+        let mut state = NetworkState {
+            broadband: BroadbandState::Authenticating,
+            ..Default::default()
+        };
+
+        let mut hung_up = false;
+        let mut dialled_again = false;
+
+        for round in 0..6 {
+            let t = evaluate(&state, &obs, &policy, 1000 + round * 5_000);
+            if t.actions
+                .iter()
+                .any(|a| matches!(a, NetworkAction::HangUpBroadband))
+            {
+                hung_up = true;
+            }
+            if t.actions
+                .iter()
+                .any(|a| matches!(a, NetworkAction::DialBroadband))
+            {
+                dialled_again = true;
+            }
+            state = t.state;
+        }
+
+        assert!(
+            !hung_up,
+            "a freshly dialled link must not be hung up merely because probes fail"
+        );
+        assert!(
+            !dialled_again,
+            "and it must certainly not be re-dialled in a loop"
+        );
+    }
+
+    #[test]
+    fn an_established_link_that_stops_passing_its_probes_is_demoted() {
+        use crate::net::*;
+
+        // The other half of the rule: once a link *has* been proven healthy, losing its probes is a
+        // real signal that the path has broken, and it must be acted on. Otherwise the fix above would
+        // have traded a dial loop for silently ignoring a dead link.
+        let policy = NetworkPolicy {
+            failure_quorum: 1,
+            ..Default::default()
+        };
+
+        let obs = NetworkObservation {
+            ras_connected: true,
+            broadband_has_ip: true,
+            broadband_default_route: true,
+            probe_results: vec![
+                ProbeOutcome {
+                    id: "a".into(),
+                    kind: ProbeKind::Tcp,
+                    ok: false,
+                    latency_ms: None,
+                    error: None,
+                },
+                ProbeOutcome {
+                    id: "b".into(),
+                    kind: ProbeKind::Tcp,
+                    ok: false,
+                    latency_ms: None,
+                    error: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = NetworkState {
+            broadband: BroadbandState::Healthy,
+            broadband_healthy_since_ms: Some(0),
+            broadband_preferred_since_ms: Some(0),
+            ..Default::default()
+        };
+
+        let mut demoted = false;
+        for round in 0..4 {
+            let t = evaluate(&state, &obs, &policy, 100_000 + round * 1_000);
+            if !matches!(t.state.broadband, BroadbandState::Healthy) {
+                demoted = true;
+            }
+            state = t.state;
+        }
+
+        assert!(
+            demoted,
+            "an established link whose probes have all failed must be demoted"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_link_dials_even_when_probes_partially_fail() {
+        use crate::net::*;
+
+        let policy = NetworkPolicy::default();
+        // Exactly this machine's situation: no RAS session, egress filtered so two TCP probes time
+        // out while a DNS probe and a hostname probe succeed. The link is still *down*, so a dial
+        // must happen - the probe results describe the current path, not whether broadband is up.
+        let obs = NetworkObservation {
+            ras_connected: false,
+            probe_results: vec![
+                ProbeOutcome {
+                    id: "a".into(),
+                    kind: ProbeKind::Tcp,
+                    ok: false,
+                    latency_ms: None,
+                    error: None,
+                },
+                ProbeOutcome {
+                    id: "b".into(),
+                    kind: ProbeKind::Tcp,
+                    ok: false,
+                    latency_ms: None,
+                    error: None,
+                },
+                ProbeOutcome {
+                    id: "c".into(),
+                    kind: ProbeKind::Dns,
+                    ok: true,
+                    latency_ms: Some(5),
+                    error: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_failure(&obs, &policy),
+            BroadbandFailureKind::PppoeSessionLost,
+            "with no session at all, the failure must be classified as the session being lost"
+        );
+
+        let mut state = NetworkState::default();
+        let mut dialled = false;
+        for round in 0..4 {
+            let t = evaluate(&state, &obs, &policy, 1000 + round * 30_000);
+            if t.actions
+                .iter()
+                .any(|a| matches!(a, NetworkAction::DialBroadband))
+            {
+                dialled = true;
+            }
+            state = t.state;
+        }
+        assert!(
+            dialled,
+            "a disconnected link must be dialled despite partial probe failure"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_link_dials_on_the_first_evaluation() {
+        use crate::net::*;
+
+        let policy = NetworkPolicy {
+            failure_quorum: 1,
+            min_dial_interval_secs: 1,
+            ..Default::default()
+        };
+        let mut state = NetworkState::default();
+
+        // Nothing is up yet: exactly the state right after a boot with no dial-up connection.
+        let obs = NetworkObservation {
+            ras_connected: false,
+            wifi_connected: true,
+            wifi_has_ip: true,
+            probe_results: vec![],
+            ..Default::default()
+        };
+
+        let t = evaluate(&state, &obs, &policy, 1000);
+        eprintln!("broadband={:?} actions={:?}", t.state.broadband, t.actions);
+        assert!(
+            t.actions
+                .iter()
+                .any(|a| matches!(a, NetworkAction::DialBroadband)),
+            "a disconnected link must be dialled on the first pass, got {:?}",
+            t.actions
+        );
+        state = t.state;
+
+        // And it must not dial again inside the minimum interval.
+        let t2 = evaluate(&state, &obs, &policy, 1500);
+        assert!(
+            !t2.actions
+                .iter()
+                .any(|a| matches!(a, NetworkAction::DialBroadband)),
+            "a second dial inside the minimum interval must be suppressed"
+        );
+    }
 
     fn policy() -> NetworkPolicy {
         NetworkPolicy {

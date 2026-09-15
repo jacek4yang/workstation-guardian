@@ -11,6 +11,7 @@ members = [
     "crates/guardian-service",
     "apps/guardian-session",
     "apps/guardianctl",
+    "apps/guardian-ui",
 ]
 
 [workspace.package]

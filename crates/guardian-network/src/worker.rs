@@ -180,9 +180,11 @@ impl<B: NetworkBackend, C: Clock, P: ProbeSource> NetworkWorker<B, C, P> {
 
         let transition = evaluate(&self.state, &observation, &self.policy, now);
 
-        // Record notes so the journal and the UI can explain what happened and why.
+        // Record notes so the journal and the UI can explain what happened and why. Logged at
+        // info because "why did it not reconnect" is exactly the question an operator asks when
+        // reading the log, and a decision that only appears at debug level does not answer it.
         for note in &transition.notes {
-            tracing::debug!(note, "network state change");
+            tracing::info!(note, "network state change");
         }
 
         // Perform the actions. Each is logged individually because a failed action must be

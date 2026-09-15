@@ -1226,24 +1226,51 @@ impl Default for NetworkConfig {
 }
 
 /// Independent connectivity probes. Several providers, none of them authoritative alone.
+///
+/// # Choosing targets
+///
+/// A default set has to work on a machine behind a filtered network — a campus or corporate
+/// connection that permits DNS and ordinary web traffic but blocks direct connections to public
+/// resolver IPs. A probe set that assumes open egress reports "partially connected" on such a
+/// machine forever, which is both noisy and, worse, would suppress a dial that should have
+/// happened.
+///
+/// So the defaults mix three kinds of evidence:
+///
+/// * a TCP connect to a **hostname**, which exercises DNS *and* routing to a real service;
+/// * a TCP connect to a well-known IP, for the common case where egress is open;
+/// * a DNS resolution, which works even where egress is filtered.
+///
+/// The quorum means no single target is authoritative, and all three are configurable.
 pub fn default_probes() -> Vec<ProbeConfig> {
     vec![
         ProbeConfig {
-            id: "cloudflare-dns-tcp".into(),
+            id: "tcp-cloudflare".into(),
             kind: ProbeKind::Tcp,
-            target: "1.1.1.1:443".into(),
-            timeout_ms: 2000,
+            // A hostname rather than a bare IP: this is the probe that most reliably reflects
+            // whether a real Internet service is reachable.
+            target: "one.one.one.one:443".into(),
+            timeout_ms: 3000,
             enabled: true,
         },
         ProbeConfig {
-            id: "google-dns-tcp".into(),
+            id: "tcp-alidns".into(),
             kind: ProbeKind::Tcp,
-            target: "8.8.8.8:443".into(),
-            timeout_ms: 2000,
+            // A second, geographically distinct operator, so one provider's outage is not read as
+            // a local network failure.
+            target: "223.5.5.5:443".into(),
+            timeout_ms: 3000,
             enabled: true,
         },
         ProbeConfig {
-            id: "system-dns".into(),
+            id: "tcp-msftconnecttest".into(),
+            kind: ProbeKind::Tcp,
+            target: "www.msftconnecttest.com:443".into(),
+            timeout_ms: 3000,
+            enabled: true,
+        },
+        ProbeConfig {
+            id: "dns-msftconnecttest".into(),
             kind: ProbeKind::Dns,
             target: "www.msftconnecttest.com".into(),
             timeout_ms: 3000,

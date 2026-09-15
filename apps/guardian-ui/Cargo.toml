@@ -1,0 +1,22 @@
+[package]
+name = "guardian-ui"
+description = "Workstation Guardian tray and control panel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+guardian-proto.workspace = true
+guardian-core.workspace = true
+guardian-service.workspace = true
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[package.metadata]

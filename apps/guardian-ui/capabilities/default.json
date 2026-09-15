@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Workstation Guardian control panel",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-show", "core:window:allow-hide", "core:window:allow-close"]
+}
