@@ -30,6 +30,19 @@ pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 /// Default named-pipe name (no `\\.\pipe\` prefix) used by the service.
 pub const PIPE_NAME: &str = "workstation-guardian-v1";
 
+/// The Windows service name, as registered with the Service Control Manager.
+///
+/// Shared so the installer, the diagnostics tool and the service itself cannot disagree about
+/// what the service is called.
+pub const SERVICE_NAME: &str = "WorkstationGuardian";
+
+/// The service's display name, shown by the Services snap-in.
+pub const SERVICE_DISPLAY_NAME: &str = "Workstation Guardian";
+
+/// What the service does, for the SCM description field.
+pub const SERVICE_DESCRIPTION: &str =
+    "Protects long-running development work from unexpected Windows Update restarts, and keeps      the network connection available.";
+
 /// Full pipe path for `CreateFile`/`ConnectNamedPipe`.
 pub const PIPE_PATH: &str = r"\\.\pipe\workstation-guardian-v1";
 

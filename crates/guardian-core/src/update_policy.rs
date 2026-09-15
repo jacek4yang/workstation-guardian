@@ -87,6 +87,17 @@ pub fn deadline_policies_to_neutralize() -> Vec<PolicyWrite> {
     ]
 }
 
+/// Whether a value name is a deadline policy rather than a protection requirement.
+///
+/// The distinction decides whether absence is acceptable: a missing protection value means the
+/// machine is unprotected, while a missing deadline policy means there is nothing that could
+/// force a restart.
+pub fn is_deadline_name(name: &str) -> bool {
+    deadline_policies_to_neutralize()
+        .iter()
+        .any(|d| d.value_name == name)
+}
+
 /// Everything Guardian intends to own on a fully-locked machine.
 pub fn all_desired_writes() -> Vec<PolicyWrite> {
     let mut v = desired_policy();
@@ -192,44 +203,52 @@ pub fn analyze(
 
         // If the value already matches, there is nothing to write and no tamper to report.
         if !matches {
-            // Was this value one Guardian had set before? If the readback shows something
-            // different from what we intended, something changed it.
             let is_deadline = deadline_policies_to_neutralize()
                 .iter()
                 .any(|d| d.key_path == desired.key_path && d.value_name == desired.value_name);
 
             if is_deadline {
-                // A deadline policy that is present and non-zero is a real hazard,
-                // regardless of whether Guardian had ever touched it. A missing or
-                // already-zero value is simply "nothing to do".
-                if observed.is_some() && observed.as_ref() != Some(&desired.value) {
-                    deadlines_neutralized
-                        .push(format!("{}\\{}", desired.key_path, desired.value_name));
-                    findings.push(Finding {
-                        severity: FindingSeverity::Warning,
-                        code: "update.deadline_present".into(),
-                        message: format!(
-                            "{} was set to {:?}; a Windows Update restart deadline could force a reboot",
-                            desired.value_name, observed
-                        ),
+                // Deadline policies are neutralized by *absence* as well as by a zero value: a
+                // policy that does not exist cannot force a restart. So an absent deadline is
+                // already safe and needs no write. Writing a zero "just in case" would mean
+                // creating three registry values on every conformant machine, forever, for no
+                // benefit - which is exactly the kind of needless churn this design avoids.
+                match &observed {
+                    None => {}
+                    Some(value) if value == &desired.value => {}
+                    Some(value) => {
+                        // Present and non-zero: a real hazard, whether or not Guardian had ever
+                        // touched it.
+                        deadlines_neutralized
+                            .push(format!("{}\\{}", desired.key_path, desired.value_name));
+                        findings.push(Finding {
+                            severity: FindingSeverity::Warning,
+                            code: "update.deadline_present".into(),
+                            message: format!(
+                                "{} was set to {value:?}; a Windows Update restart deadline could force a reboot",
+                                desired.value_name
+                            ),
+                        });
+                        writes_needed.push(desired.clone());
+                    }
+                }
+            } else {
+                if observed.is_some() {
+                    // A core value is present but wrong: something changed it out from under us.
+                    //
+                    // A value that is simply *absent* is not tampering, but it is not benign
+                    // either: it means protection is not in effect, which is reported through the
+                    // level rather than as a tamper incident. Conflating the two would make the
+                    // incident stream useless on a fresh machine.
+                    tamper.push(TamperEvent {
+                        key_path: desired.key_path.clone(),
+                        value_name: desired.value_name.clone(),
+                        expected: desired.value.clone(),
+                        observed: observed.clone(),
                     });
                 }
-            } else if observed.is_some() {
-                // A core value is present but wrong: something changed it out from under us.
-                //
-                // A value that is simply *absent* is not tampering, but it is not benign
-                // either. It means protection is not in effect, which is reported through
-                // the level (`Degraded`) rather than through a tamper incident. Conflating
-                // the two would make the incident stream useless on a fresh machine.
-                tamper.push(TamperEvent {
-                    key_path: desired.key_path.clone(),
-                    value_name: desired.value_name.clone(),
-                    expected: desired.value.clone(),
-                    observed: observed.clone(),
-                });
+                writes_needed.push(desired.clone());
             }
-
-            writes_needed.push(desired.clone());
         }
     }
 
@@ -245,13 +264,30 @@ pub fn analyze(
         .map(|v| v == 1)
         .unwrap_or(false);
 
+    // The per-value detail covers everything Guardian owns, so the operator can see the whole
+    // picture. Each entry records whether it is a *requirement* (protection) or merely a
+    // *hazard to keep neutral* (deadline), because the two mean different things:
+    //   * a protection value must be present and correct;
+    //   * a deadline value must not be present-and-harmful, which absence also satisfies.
     for desired in all_desired_writes() {
         let observed = readback
             .values
             .iter()
             .find(|o| o.key_path == desired.key_path && o.value_name == desired.value_name)
             .and_then(|o| o.value.clone());
-        let matches = observed.as_ref() == Some(&desired.value);
+
+        let is_deadline = deadline_policies_to_neutralize()
+            .iter()
+            .any(|d| d.key_path == desired.key_path && d.value_name == desired.value_name);
+
+        // For a deadline policy, "safe" means absent or zero; for a protection value it means
+        // exactly the desired value.
+        let matches = if is_deadline {
+            observed.is_none() || observed.as_ref() == Some(&desired.value)
+        } else {
+            observed.as_ref() == Some(&desired.value)
+        };
+
         values.push(PolicyValueStatus {
             name: desired.value_name.clone(),
             desired: desired.value.clone(),
@@ -267,21 +303,29 @@ pub fn analyze(
 
     let primary_lock_effective = primary_now;
 
-    // The verdict. Anything short of "everything conforms, right now, with nothing
-    // external in the way" is not Protected.
-    let all_conform_now = values.iter().all(|v| v.matches);
+    // The verdict. Anything short of "every requirement is met, right now, with nothing external
+    // in the way" is not Protected.
+    //
+    // Only the *protection* values are requirements. A deadline policy that is absent is already
+    // safe - it cannot force anything - so its absence must not drag the verdict down, or every
+    // stock Windows machine would report Degraded forever.
+    let all_conform_now = values
+        .iter()
+        .filter(|v| !is_deadline_name(&v.name))
+        .all(|v| v.matches);
+    let deadlines_safe = values
+        .iter()
+        .filter(|v| is_deadline_name(&v.name))
+        .all(|v| v.matches);
+
     let level = if externally_managed {
-        if primary_lock_effective && all_conform_now {
-            // Local policy is in place but could be overridden at any refresh. Guardian is
-            // honest about this rather than claiming a guarantee it cannot make.
-            ProtectionLevel::Degraded
-        } else {
-            ProtectionLevel::Degraded
-        }
-    } else if all_conform_now && readback.complete {
-        ProtectionLevel::Protected
+        // Local policy is in place but could be overridden at any refresh. Guardian is honest
+        // about this rather than claiming a guarantee it cannot make.
+        ProtectionLevel::Degraded
     } else if !readback.complete {
         ProtectionLevel::Unknown
+    } else if all_conform_now && deadlines_safe {
+        ProtectionLevel::Protected
     } else {
         ProtectionLevel::Degraded
     };
@@ -324,7 +368,12 @@ fn build_deadline_status(
             let full = format!("{}\\{}", d.key_path, d.value_name);
             DeadlinePolicyStatus {
                 name: d.value_name.clone(),
+                // A deadline policy is neutralized when it cannot force a restart. That is true
+                // both when it is already zero and when it is **absent**: a value that does not
+                // exist cannot force anything. Reporting an absent value as an active hazard
+                // would show a problem the machine does not have.
                 neutralized: neutralized_names.contains(&full)
+                    || observed.is_none()
                     || observed.as_ref() == Some(&d.value),
                 observed,
                 external_owner: None,
@@ -469,10 +518,30 @@ mod tests {
         );
         assert_eq!(
             a.writes_needed.len(),
-            all_desired_writes().len(),
-            "every value must be applied on a bare host"
+            desired_policy().len(),
+            "only the protection values need writing on a bare host"
+        );
+        assert!(
+            a.writes_needed
+                .iter()
+                .any(|w| w.value_name == "NoAutoUpdate"),
+            "the primary lock must be written"
+        );
+        assert!(
+            !a.writes_needed
+                .iter()
+                .any(|w| w.value_name.starts_with("Set")),
+            "an absent deadline policy must not be written: {:?}",
+            a.writes_needed
+                .iter()
+                .map(|w| &w.value_name)
+                .collect::<Vec<_>>()
         );
         assert!(a.tamper.is_empty(), "a missing value is not tampering");
+        assert!(
+            a.deadlines_neutralized.is_empty(),
+            "an absent deadline is not a hazard to neutralize"
+        );
         assert_eq!(a.level, ProtectionLevel::Degraded);
     }
 

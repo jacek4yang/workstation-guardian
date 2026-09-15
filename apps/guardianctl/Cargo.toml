@@ -18,9 +18,13 @@ guardian-update.workspace = true
 guardian-network.workspace = true
 guardian-process.workspace = true
 guardian-storage.workspace = true
+guardian-service.workspace = true
 windows.workspace = true
 windows-service.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+guardian-core = { path = "../../crates/guardian-core", features = ["test-fakes"] }

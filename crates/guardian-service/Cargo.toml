@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "guardian_service"
+path = "src/lib.rs"
+
 [[bin]]
 name = "guardian-service"
 path = "src/main.rs"

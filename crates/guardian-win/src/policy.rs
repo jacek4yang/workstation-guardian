@@ -152,27 +152,62 @@ impl PolicyBackend {
         }
     }
 
-    /// Detect MDM enrollment.
+    /// Detect whether this machine is actually managed by MDM.
     ///
-    /// `HKLM\SOFTWARE\Microsoft\Enrollments` contains a subkey per enrollment. Plain
-    /// `EnrollmentType` values (1 = MDM service declaration) appear even on unmanaged
-    /// machines, so enrollment is only concluded when there is a *provider* or an
-    /// enterprise-management enrolment, which is what actually implies push policy.
+    /// # Why the enrollment registry alone is not a reliable signal
+    ///
+    /// `HKLM\SOFTWARE\Microsoft\Enrollments` contains many entries on a *completely unmanaged*
+    /// machine. Measured on a stock Windows 11 workstation, its subkeys carry `EnrollmentState=1`
+    /// with `EnrollmentType` values of 1, 2, 10, 11, 18, 28, 29, 30, 31 and 32, and `ProviderID`
+    /// values of "Local Authority", "Cloud Authority" and "Deploy Authority".
+    ///
+    /// None of those means the machine is managed. They are the policy-authority declarations
+    /// that Windows ships with, and treating them as enrollment produces a permanent false
+    /// `Degraded` - which teaches the operator to ignore the very warning that matters.
+    ///
+    /// # The signal that does mean something
+    ///
+    /// MDM delivers policy through the `PolicyManager` configuration service provider, which
+    /// materialises as scopes under `PolicyManager\current\device`. A managed machine has an
+    /// update scope there carrying policy; an unmanaged one does not. This checks for actual
+    /// policy in the scopes that would affect update behaviour, which is precisely the question
+    /// being asked.
+    ///
+    /// `EnrollmentType = 6` (the documented MDM push value) is also accepted, since it does not
+    /// appear on unmanaged machines.
     fn mdm_enrollment(&self) -> Option<String> {
-        // The most reliable signal is the enterprise management provider list.
-        if let Some(provider) = self.enterprise_management_provider() {
-            return Some(provider);
+        for scope in ["Update", "UpdateRing", "WindowsUpdate"] {
+            let path = RegPath::local_machine(format!("{POLICY_MANAGER_CURRENT}\\{scope}"));
+            let Ok(key) = RegKey::open_read(&path) else {
+                continue;
+            };
+            let Ok(values) = key.value_names() else {
+                continue;
+            };
+            if values.is_empty() {
+                continue;
+            }
+            let names: Vec<&str> = values.iter().take(5).map(|(n, _)| n.as_str()).collect();
+            return Some(format!(
+                "PolicyManager '{}' scope carries {} value(s): {}",
+                scope,
+                values.len(),
+                names.join(", ")
+            ));
         }
 
         let path = RegPath::local_machine(ENROLLMENTS_KEY);
-        let key = RegKey::open_read(&path).ok()?;
-        let subkeys = key.subkeys().ok()?;
+        let Ok(key) = RegKey::open_read(&path) else {
+            return None;
+        };
+        let Ok(subkeys) = key.subkeys() else {
+            return None;
+        };
 
         for sub in subkeys {
-            let child = RegKey::open_read(&path.join(&sub)).ok();
-            let Some(child) = child else { continue };
-
-            // EnrollmentState: 1 = enrolled. EnrollmentType: 6 = MDM push.
+            let Ok(child) = RegKey::open_read(&path.join(&sub)) else {
+                continue;
+            };
             let state = child
                 .get_value("EnrollmentState")
                 .ok()
@@ -183,38 +218,32 @@ impl PolicyBackend {
                 .ok()
                 .flatten()
                 .and_then(|v| v.as_dword());
+            let provider = child.get_value("ProviderID").ok().flatten();
 
-            let enrolled = state == Some(1);
-            let is_push = matches!(ty, Some(6) | Some(3));
+            // 6 is the documented MDM push enrollment type.
+            let is_push = ty == Some(6);
 
-            if enrolled && is_push {
-                return Some(format!("enrollment {sub}"));
-            }
-
-            // A `ProviderID` under an enrolled entry is also conclusive.
-            if enrolled {
-                if let Ok(Some(p)) = child.get_value("ProviderID") {
-                    let text = match p {
-                        PolValue::String(s) => s,
-                        PolValue::ExpandString(s) => s,
-                        PolValue::MultiString(_) | PolValue::Dword(_) => continue,
-                    };
-                    if !text.trim().is_empty() {
-                        return Some(text.trim().to_string());
-                    }
+            // An explicit enterprise provider name, which only a real enrollment sets.
+            let named_provider = match provider {
+                Some(PolValue::String(s)) => {
+                    let t = s.trim().to_ascii_lowercase();
+                    !t.is_empty()
+                        && (t.contains("enterprise")
+                            || t.contains("intune")
+                            || t.contains("mdm")
+                            || t.contains("airwatch")
+                            || t.contains("workspace one"))
                 }
+                Some(PolValue::ExpandString(s)) => s.to_ascii_lowercase().contains("intune"),
+                _ => false,
+            };
+
+            if state == Some(1) && (is_push || named_provider) {
+                return Some(format!("enrollment {sub} (type {ty:?})"));
             }
         }
 
         None
-    }
-
-    /// Read the enterprise management provider list, which names the MDM authority.
-    fn enterprise_management_provider(&self) -> Option<String> {
-        let path = RegPath::local_machine(r"SOFTWARE\Microsoft\Enrollments\Status");
-        let key = RegKey::open_read(&path).ok()?;
-        let subkeys = key.subkeys().ok()?;
-        subkeys.into_iter().next().map(|s| format!("status {s}"))
     }
 
     /// Whether `PolicyManager` carries update policy that would outrank local policy.

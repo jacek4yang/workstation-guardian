@@ -22,14 +22,23 @@
 
 pub mod boot;
 pub mod clock;
+pub mod elevation;
 pub mod eventlog;
 pub mod pipe;
 pub mod policy;
 pub mod process;
 pub mod ras;
 pub mod registry;
+pub mod service;
 pub mod session;
 pub mod wifi;
+
+/// The service description used at install time.
+///
+/// Defined here rather than in the installer so the module that writes it and the constant
+/// that describes it cannot drift.
+pub const SERVICE_DESCRIPTION_TEXT: &str =
+    "Protects long-running development work from unexpected Windows Update restarts, and keeps      the network connection available.";
 
 /// Errors from the Win32 layer.
 ///

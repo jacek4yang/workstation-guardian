@@ -30,6 +30,7 @@ guardian-win = { path = "crates/guardian-win" }
 guardian-process = { path = "crates/guardian-process" }
 guardian-network = { path = "crates/guardian-network" }
 guardian-update = { path = "crates/guardian-update" }
+guardian-service = { path = "crates/guardian-service" }
 
 # Windows
 windows = { version = "0.62", features = [

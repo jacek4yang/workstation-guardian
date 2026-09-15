@@ -224,6 +224,7 @@ dependencies = [
  "guardian-network",
  "guardian-process",
  "guardian-proto",
+ "guardian-service",
  "guardian-storage",
  "guardian-update",
  "guardian-win",
