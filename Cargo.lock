@@ -95,8 +95,10 @@ dependencies = [
  "guardian-proto",
  "regex",
  "serde",
+ "serde_json",
  "thiserror",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

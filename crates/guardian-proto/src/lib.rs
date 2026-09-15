@@ -81,12 +81,16 @@ impl Principal {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Liveness + version negotiation.
-    Hello { protocol: u16 },
+    Hello {
+        protocol: u16,
+    },
 
     // ---- read-only status surface (any authenticated principal) ----
     GetStatus,
     GetAgents,
-    GetIncidents { limit: u16 },
+    GetIncidents {
+        limit: u16,
+    },
     GetNetwork,
     GetPendingReboot,
     GetConfig,
@@ -95,7 +99,9 @@ pub enum Request {
 
     // ---- privileged operations ----
     /// Try to reconnect the configured PPPoE entry now.
-    Reconnect { reason: String },
+    Reconnect {
+        reason: String,
+    },
     /// Ask to leave `LOCKED`. Denied when protected work exists unless `override_guard` is
     /// true, in which case a second confirmation is required by the UI.
     EnterMaintenance {
@@ -105,7 +111,9 @@ pub enum Request {
     /// Abandon maintenance without rebooting; protection is reapplied immediately.
     ExitMaintenance,
     /// Convert a live maintenance session into a single-use reboot authorization.
-    ArmSingleReboot { ttl_secs: u32 },
+    ArmSingleReboot {
+        ttl_secs: u32,
+    },
     /// Discard an armed reboot authorization.
     DisarmReboot,
     GetRebootAuthorization,
@@ -114,17 +122,27 @@ pub enum Request {
     /// Long-poll for protection-state pushes. The service keeps the connection open and
     /// streams `Push` messages; this is how the session helper learns it must (un)block
     /// shutdown without polling.
-    Subscribe { client: SubscriberKind },
+    Subscribe {
+        client: SubscriberKind,
+    },
 
     // ---- configuration ----
     /// Replace the whole configuration document (already validated by the service).
-    UpdateConfig { config: Box<ConfigDocument> },
+    UpdateConfig {
+        config: Box<ConfigDocument>,
+    },
     /// Append a user-defined agent signature.
-    AddAgentSignature { signature: Box<AgentSignature> },
+    AddAgentSignature {
+        signature: Box<AgentSignature>,
+    },
     /// Remove a user-defined agent signature by id.
-    RemoveAgentSignature { id: String },
+    RemoveAgentSignature {
+        id: String,
+    },
     /// Promote a candidate found by the discovery engine into a local signature.
-    PromoteCandidate { candidate_id: String },
+    PromoteCandidate {
+        candidate_id: String,
+    },
 }
 
 impl Request {
@@ -211,7 +229,9 @@ pub enum Response {
     Config(Box<ConfigDocument>),
     Health(Box<HealthReport>),
     RebootAuthorization(Box<Option<RebootAuthorization>>),
-    Ok { message: String },
+    Ok {
+        message: String,
+    },
     Error(ProtocolError),
 }
 
@@ -288,7 +308,10 @@ mod tests {
     #[test]
     fn privilege_classes_are_asymmetric() {
         // The whole point of the closed protocol: config mutation is not a user operation.
-        assert_eq!(Request::GetStatus.required_principal(), Principal::InteractiveUser);
+        assert_eq!(
+            Request::GetStatus.required_principal(),
+            Principal::InteractiveUser
+        );
         assert_eq!(
             Request::EnterMaintenance {
                 override_protected_work: true,

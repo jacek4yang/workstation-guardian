@@ -103,13 +103,10 @@ impl AtomicFile {
     /// Sequence: create temp in the *same directory* (so the rename cannot cross a volume),
     /// write, `flush` (userspace), `sync_all` (to the platter), then rename over the target.
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), StorageError> {
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| StorageError::Corrupt {
-                path: self.path.clone(),
-                detail: "atomic file has no parent directory".into(),
-            })?;
+        let dir = self.path.parent().ok_or_else(|| StorageError::Corrupt {
+            path: self.path.clone(),
+            detail: "atomic file has no parent directory".into(),
+        })?;
         fs::create_dir_all(dir).map_err(|e| StorageError::io(dir, e))?;
 
         let tmp = temp_sibling(&self.path);
@@ -118,8 +115,7 @@ impl AtomicFile {
         // an open file can fail with a sharing violation.
         {
             let mut f = File::create(&tmp).map_err(|e| StorageError::io(&tmp, e))?;
-            f.write_all(bytes)
-                .map_err(|e| StorageError::io(&tmp, e))?;
+            f.write_all(bytes).map_err(|e| StorageError::io(&tmp, e))?;
             f.flush().map_err(|e| StorageError::io(&tmp, e))?;
             // Durability: without this a power loss can leave a zero-length temp file that
             // the (metadata-only) rename happily publishes.
@@ -361,13 +357,10 @@ pub struct JournalRead {
 impl JournalRead {
     /// Newest valid checkpoint, which is what recovery actually uses.
     pub fn latest_checkpoint(&self) -> Option<&Checkpoint> {
-        self.records
-            .iter()
-            .rev()
-            .find_map(|r| match r {
-                JournalRecord::Checkpoint(c) => Some(c.as_ref()),
-                _ => None,
-            })
+        self.records.iter().rev().find_map(|r| match r {
+            JournalRecord::Checkpoint(c) => Some(c.as_ref()),
+            _ => None,
+        })
     }
 
     /// True when the log contains a `CleanShutdown` written after the given session start.
@@ -447,18 +440,16 @@ impl Journal {
         frame.extend_from_slice(&crc.to_le_bytes());
         frame.extend_from_slice(&payload);
 
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| StorageError::Corrupt {
-                path: self.path.clone(),
-                detail: "journal closed".into(),
-            })?;
+        let file = self.file.as_mut().ok_or_else(|| StorageError::Corrupt {
+            path: self.path.clone(),
+            detail: "journal closed".into(),
+        })?;
         file.write_all(&frame)
             .map_err(|e| StorageError::io(&self.path, e))?;
         file.flush().map_err(|e| StorageError::io(&self.path, e))?;
         if sync {
-            file.sync_all().map_err(|e| StorageError::io(&self.path, e))?;
+            file.sync_all()
+                .map_err(|e| StorageError::io(&self.path, e))?;
         }
         self.bytes_written += frame.len() as u64;
         Ok(())
@@ -573,7 +564,8 @@ impl Journal {
         self.file = Some(f);
         self.bytes_written = 0;
         Ok(())
-    }}
+    }
+}
 
 /// CRC-32 (IEEE 802.3), implemented locally to avoid pulling in a dependency for one
 /// function. Table-free bitwise form is plenty fast for records of a few kilobytes.
@@ -787,7 +779,10 @@ mod tests {
         fs::write(&p, br#"{"schema_version": 1, "upd"#).unwrap();
         let f = AtomicFile::new(&p);
         let err = f.read_json::<ConfigDocument>().unwrap_err();
-        assert!(err.is_corruption(), "truncated JSON must read as corruption");
+        assert!(
+            err.is_corruption(),
+            "truncated JSON must read as corruption"
+        );
 
         let q = f.quarantine().unwrap();
         assert!(q.exists());
@@ -961,43 +956,47 @@ mod tests {
 
     #[test]
     fn clean_shutdown_detection_is_session_scoped() {
-        let mut read = JournalRead::default();
-        read.records = vec![
-            JournalRecord::SessionStart {
-                boot_id: "b1".into(),
-                session_id: "s1".into(),
-                started_at_ms: 0,
-                version: "0.1.0".into(),
-            },
-            JournalRecord::CleanShutdown {
-                at_ms: 10,
-                uptime_ms: 10,
-            },
-        ];
+        let read = JournalRead {
+            records: vec![
+                JournalRecord::SessionStart {
+                    boot_id: "b1".into(),
+                    session_id: "s1".into(),
+                    started_at_ms: 0,
+                    version: "0.1.0".into(),
+                },
+                JournalRecord::CleanShutdown {
+                    at_ms: 10,
+                    uptime_ms: 10,
+                },
+            ],
+            ..Default::default()
+        };
         assert!(read.session_ended_cleanly("s1"));
         // A different session must not inherit the clean marker.
         assert!(!read.session_ended_cleanly("s2"));
 
         // A session that started after the clean marker and never finished is unclean.
-        let mut read2 = JournalRead::default();
-        read2.records = vec![
-            JournalRecord::SessionStart {
-                boot_id: "b1".into(),
-                session_id: "s1".into(),
-                started_at_ms: 0,
-                version: "0.1.0".into(),
-            },
-            JournalRecord::CleanShutdown {
-                at_ms: 10,
-                uptime_ms: 10,
-            },
-            JournalRecord::SessionStart {
-                boot_id: "b2".into(),
-                session_id: "s2".into(),
-                started_at_ms: 20,
-                version: "0.1.0".into(),
-            },
-        ];
+        let read2 = JournalRead {
+            records: vec![
+                JournalRecord::SessionStart {
+                    boot_id: "b1".into(),
+                    session_id: "s1".into(),
+                    started_at_ms: 0,
+                    version: "0.1.0".into(),
+                },
+                JournalRecord::CleanShutdown {
+                    at_ms: 10,
+                    uptime_ms: 10,
+                },
+                JournalRecord::SessionStart {
+                    boot_id: "b2".into(),
+                    session_id: "s2".into(),
+                    started_at_ms: 20,
+                    version: "0.1.0".into(),
+                },
+            ],
+            ..Default::default()
+        };
         assert!(read2.session_ended_cleanly("s1"));
         assert!(!read2.session_ended_cleanly("s2"));
     }
@@ -1022,9 +1021,11 @@ mod tests {
         let paths = GuardianPaths::for_test_dir(d.0.clone());
         let store = Store::open(paths).unwrap();
 
-        let mut st = PersistentState::default();
-        st.last_boot_id = "boot-x".into();
-        st.start_count = 3;
+        let st = PersistentState {
+            last_boot_id: "boot-x".into(),
+            start_count: 3,
+            ..Default::default()
+        };
         store.save_state(&st).unwrap();
         let (loaded, err) = store.load_state();
         assert!(err.is_none());

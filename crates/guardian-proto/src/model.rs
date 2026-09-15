@@ -165,7 +165,7 @@ pub struct DeadlinePolicyStatus {
 }
 
 /// How this machine's update policy is governed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ManagementState {
     /// Not domain joined, no MDM enterprise enrollment. Local policy is authoritative.
@@ -177,6 +177,11 @@ pub enum ManagementState {
     /// Both, or an unexpected combination.
     DomainAndMdm { domain: String, provider: String },
     /// Could not determine. Treated as at-risk.
+    ///
+    /// This is the `Default` deliberately: an unknown management state must never be
+    /// treated as "unmanaged", because that would let Guardian claim protection it may not
+    /// actually have.
+    #[default]
     Unknown,
 }
 
@@ -362,7 +367,12 @@ pub struct Evidence {
 }
 
 impl Evidence {
-    pub fn new(code: impl Into<String>, matched: impl Into<String>, weight: i32, detail: impl Into<String>) -> Self {
+    pub fn new(
+        code: impl Into<String>,
+        matched: impl Into<String>,
+        weight: i32,
+        detail: impl Into<String>,
+    ) -> Self {
         Evidence {
             code: code.into(),
             matched: matched.into(),
@@ -1402,7 +1412,7 @@ impl Default for NotificationConfig {
 mod tests {
     use super::*;
 
-    fn inst(pid: u32, root: u32, conf: Confidence, owner: Option<&str>) -> AgentInstance {
+    fn inst(pid: u32, root: u32, conf: Confidence, _owner: Option<&str>) -> AgentInstance {
         AgentInstance {
             kind: "test".into(),
             display_name: "Test".into(),
