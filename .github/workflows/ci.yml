@@ -43,9 +43,10 @@ jobs:
         run: cargo build --workspace --release --all-features
 
       - name: Audit dependencies
-        # Informational: a newly disclosed advisory should be visible without blocking every
-        # unrelated change on a transitive dependency.
+        # Informational: a newly disclosed advisory should be visible without blocking an
+        # unrelated change on a transitive dependency. cargo-audit is installed from a prebuilt
+        # binary rather than compiled, because building it dominated the job's runtime.
         continue-on-error: true
-        run: |
-          cargo install cargo-audit --locked --quiet || true
-          cargo audit --ignore-unmaintained || true
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
