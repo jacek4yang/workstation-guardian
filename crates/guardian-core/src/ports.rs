@@ -60,8 +60,21 @@ pub struct PolicyObservation {
     pub value: Option<PolValue>,
 }
 
-/// The value as Guardian originally found it, for exact restoration.
-pub type OwnedPolicy = PolicyWrite;
+/// A policy value as Guardian originally found it, for exact restoration.
+///
+/// Distinct from [`PolicyWrite`] because `value` is optional: `None` records that the value
+/// did not exist before Guardian created it, so restoring means *deleting* it. Collapsing
+/// that into `PolicyWrite` would lose the ability to distinguish "restore to absent" from
+/// "restore to this value", and uninstall would leave Guardian's values behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedPolicy {
+    pub key_path: String,
+    pub value_name: String,
+    /// The value as it was, or `None` when the value did not exist.
+    pub value: Option<PolValue>,
+    /// True when Guardian created the key, so uninstall may remove it if it is empty.
+    pub created_key: bool,
+}
 
 /// Reads pending-reboot signals from the OS.
 pub trait PendingRebootSource {
@@ -299,10 +312,15 @@ pub mod fakes {
             let mut store = self.store.borrow_mut();
             for w in original {
                 store.retain(|o| !(o.key_path == w.key_path && o.value_name == w.value_name));
+                // `None` means the value did not exist before Guardian created it, so
+                // restoring leaves it absent rather than writing an invented default.
+                if w.value.is_none() {
+                    continue;
+                }
                 store.push(PolicyObservation {
                     key_path: w.key_path.clone(),
                     value_name: w.value_name.clone(),
-                    value: Some(w.value.clone()),
+                    value: w.value.clone(),
                 });
             }
             Ok(())

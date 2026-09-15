@@ -8,8 +8,11 @@ license.workspace = true
 
 [dependencies]
 guardian-proto.workspace = true
+guardian-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 windows.workspace = true
 windows-service.workspace = true
+time.workspace = true
+serde_json.workspace = true

@@ -203,9 +203,12 @@ dependencies = [
 name = "guardian-win"
 version = "0.1.0"
 dependencies = [
+ "guardian-core",
  "guardian-proto",
  "serde",
+ "serde_json",
  "thiserror",
+ "time",
  "tracing",
  "windows",
  "windows-service",
