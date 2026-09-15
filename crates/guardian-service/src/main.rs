@@ -102,6 +102,7 @@ pub fn run_service_body() {
 
     let clock = SystemClock;
     let boot_id = SystemBootIdentity::read();
+    let started_at = std::time::Instant::now();
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -217,9 +218,24 @@ pub fn run_service_body() {
             }
         }));
 
+    // Record what the *previous* session looked like, in this session's journal.
+    //
+    // This deliberately does not fabricate a `shutdown_observed` record. That record means "we saw
+    // the machine go down", and a service starting up has seen no such thing. Writing one on every
+    // start with a flag borrowed from an unrelated concept produced a journal full of events that
+    // never happened, which is worse than useless when it is later read to reconstruct a crash.
+    //
+    // A `network_event` carries the same information without claiming an observation: the
+    // conclusion about the previous session, as text.
     if let Ok(mut guard) = recovery_journal.lock() {
         if let Some(j) = guard.as_mut() {
-            j.shutdown_observed(&SystemClock, previous.truncated, None, false);
+            j.network_event(
+                &SystemClock,
+                &format!(
+                    "previous session: {}",
+                    journal::describe_previous(&previous)
+                ),
+            );
         }
     }
 
@@ -460,8 +476,20 @@ pub fn run_service_body() {
     // ---- 8. Main loop --------------------------------------------------------
     // Nothing here blocks: it polls the shutdown flag so a stop request is honoured promptly.
     let mut last_incident_count = 0usize;
+    let run_deadline = run_duration_limit();
     while !shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
+
+        // A bounded run, requested from the command line. This exists so the clean-shutdown path
+        // can be exercised end to end without an SCM and without signalling a console: the test
+        // starts the service, waits, and then reads the journal to confirm the marker was written.
+        // It also makes a smoke run easy on a machine where installing the service is not wanted.
+        if let Some(limit) = run_deadline {
+            if started_at.elapsed() >= limit {
+                tracing::info!("configured run duration elapsed; stopping");
+                break;
+            }
+        }
 
         // Surface incidents that workers raised.
         let incidents = supervisor.take_incidents();
@@ -528,6 +556,17 @@ pub fn run_service_body() {
     coordinator.set_helper_connected(false);
 
     tracing::info!("Workstation Guardian service stopped cleanly");
+}
+
+/// How long to run, when `--run-for-seconds=<n>` was passed.
+///
+/// Used to exercise the clean-shutdown path in a test, and to allow a bounded smoke run on a
+/// machine where installing the service is not wanted.
+fn run_duration_limit() -> Option<Duration> {
+    std::env::args()
+        .find_map(|a| a.strip_prefix("--run-for-seconds=").map(str::to_string))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// Load configuration, falling back to defaults on corruption.
