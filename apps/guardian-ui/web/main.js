@@ -233,8 +233,18 @@ function renderPanel(payload) {
 
   // A machine that is not elevated cannot have its policy applied. Saying that plainly is the
   // difference between an operator fixing it and an operator believing they are covered.
+  //
+  // The relayed flag is cross-checked against what the runtime actually achieved. Update
+  // protection reading "Protected" is proof that the policy was written, which is only possible
+  // with administrator rights. If the two disagree, the runtime's own report wins: offering a
+  // UAC prompt to a process that is already elevated is a pointless interruption, and showing it
+  // beside a green "Protected" row is a contradiction the operator is right not to trust.
+  const protectionProvesElevation =
+    panel.update && String(panel.update.level).toLowerCase() === "protected";
+  const elevated = Boolean(payload.elevated) || protectionProvesElevation;
+
   const warnings = [];
-  if (!payload.elevated) warnings.push(t("not_elevated"));
+  if (!elevated) warnings.push(t("not_elevated"));
   if (panel.unclean_previous_exit) warnings.push(t("recovered"));
   const warning = el("warning");
   if (warnings.length) {
@@ -244,9 +254,8 @@ function renderPanel(payload) {
     warning.hidden = true;
   }
 
-  // The restart button is offered only when it would actually change something: this process is
-  // not elevated. Showing it otherwise would invite a pointless UAC prompt.
-  show(el("restart-elevated"), !payload.elevated);
+  // The restart button is offered only when it would actually change something.
+  show(el("restart-elevated"), !elevated);
 
   setLevel("update-level", panel.update.level, panel.update.label);
   setLevel("restart-level", panel.restart_protection.level, panel.restart_protection.label);

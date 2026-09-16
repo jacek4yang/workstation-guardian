@@ -72,21 +72,34 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
 ///
 /// Deliberately tiny: the only thing the UI needs from the runtime is the state handle and the
 /// ability to ask it to stop. Everything else the panel displays comes out of `ServiceState`.
-#[derive(Default)]
 struct UiBridge {
     /// `None` until the runtime has published its state.
     runtime: Mutex<Option<GuardianRuntime>>,
     /// Whether the runtime has been asked to stop, so the exit path runs once.
     exiting: AtomicBool,
-    /// Set when this process is not elevated, so the panel can say what is not protected.
-    elevated: AtomicBool,
+    /// Whether this process is elevated.
+    ///
+    /// Read once at construction and never mutated. It used to be a flag set when the runtime
+    /// published its state, which meant any panel read before that returned the `false` default —
+    /// and the panel would then show "Restart as administrator" beside an update-protection row
+    /// reading `Protected`. Those two cannot both be true, and the contradiction is what an
+    /// operator notices. Elevation is a property of the process that exists from the moment it
+    /// starts, so it is decided then.
+    elevated: bool,
 }
 
 impl UiBridge {
-    /// Publish the runtime. Returns the state handle and whether this process is elevated.
-    fn attach(&self, runtime: GuardianRuntime, elevated: bool) -> SharedState {
+    fn new() -> Self {
+        UiBridge {
+            runtime: Mutex::new(None),
+            exiting: AtomicBool::new(false),
+            elevated: guardian_win::elevation::is_elevated(),
+        }
+    }
+
+    /// Publish the runtime. Returns the state handle.
+    fn attach(&self, runtime: GuardianRuntime) -> SharedState {
         let shared = runtime.state();
-        self.elevated.store(elevated, Ordering::SeqCst);
         if let Ok(mut guard) = self.runtime.lock() {
             *guard = Some(runtime);
         }
@@ -121,7 +134,7 @@ impl UiBridge {
     }
 
     fn is_elevated(&self) -> bool {
-        self.elevated.load(Ordering::SeqCst)
+        self.elevated
     }
 
     /// Ask the runtime to stop and wait, briefly, for it to finish.
@@ -246,7 +259,7 @@ fn configured_language() -> Lang {
 
 fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
-        .manage(UiBridge::default())
+        .manage(UiBridge::new())
         .manage(configured_language())
         .invoke_handler(tauri::generate_handler![
             get_panel,
@@ -282,6 +295,16 @@ fn start_runtime(app: AppHandle) {
     std::thread::spawn(move || {
         let elevated = guardian_win::elevation::is_elevated();
 
+        // Start the session helper before the runtime, so the first status a user sees is not a
+        // degraded one that resolves itself a moment later. The helper owns the shutdown block, and
+        // without it restart protection genuinely is degraded — so starting it is part of doing the
+        // job, not an optional extra.
+        if !autostart::ensure_helper_running() {
+            tracing::warn!(
+                "the session helper is not running and could not be started;                  shutdowns will not be held while work is in progress"
+            );
+        }
+
         run(
             RuntimeOptions {
                 run_for: None,
@@ -289,7 +312,7 @@ fn start_runtime(app: AppHandle) {
             },
             move |runtime| {
                 let bridge = app.state::<UiBridge>();
-                let shared = bridge.attach(runtime, elevated);
+                let shared = bridge.attach(runtime);
 
                 if !elevated {
                     tracing::warn!(
@@ -948,24 +971,41 @@ mod tests {
     }
 
     #[test]
+    fn elevation_is_known_before_the_runtime_starts() {
+        // Regression. Elevation was stored when the runtime published its state, so any panel read
+        // before that returned the `false` default. The panel then showed "Restart as
+        // administrator" beside an update-protection row reading `Protected` - two claims that
+        // cannot both be true, and the kind of contradiction that costs an operator's trust in
+        // everything else on the page.
+        //
+        // Elevation is a property of the process from the moment it starts, so it is answered from
+        // the moment the bridge exists.
+        let bridge = UiBridge::new();
+        assert!(bridge.with_state(|_| ()).is_none(), "no runtime yet");
+
+        // And it already agrees with the process's actual token.
+        assert_eq!(bridge.is_elevated(), guardian_win::elevation::is_elevated());
+    }
+
+    #[test]
     fn a_detached_bridge_reports_nothing_rather_than_a_blank_panel() {
         // A panel that showed zeros while the first protection pass is still running would look
         // exactly like a machine with no protection and no agents.
-        let bridge = UiBridge::default();
+        let bridge = UiBridge::new();
         assert!(bridge.panel(Lang::En).is_none());
         assert!(bridge.with_state(|_| ()).is_none());
     }
 
     #[test]
     fn requesting_a_stop_before_the_runtime_exists_is_harmless() {
-        let bridge = UiBridge::default();
+        let bridge = UiBridge::new();
         bridge.request_stop(); // must not panic, must not block
         assert!(bridge.exiting.load(Ordering::SeqCst));
     }
 
     #[test]
     fn a_second_stop_request_returns_immediately() {
-        let bridge = UiBridge::default();
+        let bridge = UiBridge::new();
         bridge.request_stop();
         let start = std::time::Instant::now();
         bridge.request_stop();

@@ -13,9 +13,16 @@
 //!
 //! * **Guardian itself** — `guardian-ui.exe`, so the machine is protected from logon. Optional.
 //! * **The session helper** — `guardian-session.exe`, which is what lets Guardian hold a shutdown
-//!   while work is running. Without it Guardian still locks Windows Update, but it cannot block a
-//!   shutdown, and it says so: restart protection reads `Degraded` rather than claiming a
-//!   capability it does not have.
+//!   while work is running.
+//!
+//! # Two separate concerns, deliberately
+//!
+//! *Starting* the helper is Guardian's own job, and it does it without asking: see
+//! [`ensure_helper_running`]. A protection tool whose safe state requires the user to find a
+//! checkbox is a protection tool that ships broken by default.
+//!
+//! *Surviving a reboot* is the user's decision, and that is what the logon toggle is for. Nothing
+//! is written to the registry unless it is asked for.
 //!
 //! The helper must run in the interactive user's session, so it belongs under `HKCU\...\Run`
 //! rather than anywhere machine-wide. That is a Windows requirement, not a preference: a process
@@ -131,6 +138,67 @@ fn disable() -> Result<(), WinError> {
     Ok(())
 }
 
+/// Start the session helper if it is not already running.
+///
+/// # Why this is not left to the logon toggle
+///
+/// The helper is what makes restart protection real. Leaving it to an opt-in toggle meant the
+/// program shipped in a permanently degraded state: `Restart protection` read `Degraded` on every
+/// screenshot, with no obvious cause and nothing the operator could see to fix. That is a bad
+/// default for a protection tool — the safe state should be the one you get without asking.
+///
+/// So Guardian starts the helper the same way it applies the update policy: unprompted, as part of
+/// doing its job. The logon toggle remains, because *surviving a reboot* is a persistence decision
+/// the user should make, whereas starting a sibling process now is not.
+///
+/// Returns whether a helper is running afterwards.
+pub fn ensure_helper_running() -> bool {
+    if helper_running() {
+        return true;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(helper) = helper_beside(&exe) else {
+        // Not shipped alongside, so there is nothing to start. Reported, not guessed at: the
+        // degraded state is honest and the panel explains it.
+        return false;
+    };
+
+    // Launched without a shell. The path is ours, discovered beside our own executable, and no
+    // argument is taken from anywhere a caller could influence.
+    match std::process::Command::new(&helper)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), path = %helper.display(), "session helper started");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %helper.display(), "could not start the session helper");
+            false
+        }
+    }
+}
+
+/// Whether `guardian-session.exe` is currently running.
+///
+/// The helper is started once per interactive session and exits with it, so its absence in this
+/// session is the condition that matters.
+pub fn helper_running() -> bool {
+    guardian_win::process::enumerate_processes()
+        .map(|procs| {
+            procs
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case("guardian-session.exe"))
+        })
+        .unwrap_or(false)
+}
+
 /// Where `guardian-session.exe` is, if it is beside this executable.
 ///
 /// Both binaries ship in the same directory, so the sibling is the right answer. `None` means it
@@ -191,6 +259,38 @@ mod tests {
             partial.any(),
             "the helper alone still means something starts"
         );
+    }
+
+    #[test]
+    fn running_the_helper_is_idempotent() {
+        // Called on every start. Starting a second helper would give two processes competing to
+        // hold the shutdown block, so the check that one is already running has to work.
+        let first = ensure_helper_running();
+        if first {
+            // A helper is up now. Asking again must not start another.
+            let before = helper_count();
+            assert!(ensure_helper_running());
+            assert_eq!(
+                helper_count(),
+                before,
+                "a second call must not start a second helper"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_running_agrees_with_the_process_table() {
+        assert_eq!(helper_running(), helper_count() > 0);
+    }
+
+    fn helper_count() -> usize {
+        guardian_win::process::enumerate_processes()
+            .map(|p| {
+                p.iter()
+                    .filter(|p| p.name.eq_ignore_ascii_case("guardian-session.exe"))
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     #[test]
