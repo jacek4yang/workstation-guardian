@@ -65,7 +65,21 @@ const STRINGS = {
     guarantee_note:
       "Guardian reduces the risk of an unexpected restart. It cannot make Windows unable to reboot.",
     not_elevated:
-      "Not running as administrator: the Windows Update policy cannot be applied. Restart Guardian as administrator for full protection.",
+      "Not running as administrator, so the Windows Update policy cannot be applied. Updates are not currently held back.",
+    restart_elevated: "Restart as administrator",
+    restarting_elevated: "Restarting with administrator rights…",
+    elevation_declined:
+      "Administrator rights were not granted. Guardian is still running and protecting what it can.",
+    elevation_failed: "Could not restart as administrator.",
+    settings: "Settings",
+    start_at_logon: "Start Guardian at logon",
+    start_at_logon_note:
+      "Adds Guardian to your own startup (HKCU). It also starts the session helper, which is what lets Guardian hold a shutdown while work is running. Nothing machine-wide is changed, and turning this off removes both entries.",
+    start_at_logon_unavailable:
+      "guardian-session.exe was not found beside Guardian, so startup cannot be registered. Keep both files in the same folder.",
+    autostart_failed: "Could not change the startup setting.",
+    autostart_on: "Guardian will now start at logon, along with the session helper.",
+    autostart_off: "Guardian will no longer start at logon. Both startup entries were removed.",
     recovered: "The previous session ended unexpectedly. State was recovered; no work was discarded.",
     confirm: "Confirm",
     cancel: "Cancel",
@@ -117,7 +131,20 @@ const STRINGS = {
     exit_note: "关闭此窗口只会隐藏到托盘，保护将继续。只有“退出 Guardian”才会停止保护。",
     guarantee_note: "Guardian 可降低意外重启的风险，但无法让 Windows 完全无法重启。",
     not_elevated:
-      "未以管理员身份运行：无法应用 Windows Update 策略。请以管理员身份重新启动 Guardian 以获得完整保护。",
+      "未以管理员身份运行，因此无法应用 Windows Update 策略。目前更新未被抑制。",
+    restart_elevated: "以管理员身份重新启动",
+    restarting_elevated: "正在以管理员权限重启…",
+    elevation_declined: "未获得管理员权限。Guardian 仍在运行，并保护其能够保护的部分。",
+    elevation_failed: "无法以管理员身份重启。",
+    settings: "设置",
+    start_at_logon: "登录时启动 Guardian",
+    start_at_logon_note:
+      "将 Guardian 加入你的启动项（HKCU）。同时会启动会话助手，它让 Guardian 在有任务运行时能够阻止关机。不会修改任何全局设置，关闭此项会移除这两项。",
+    start_at_logon_unavailable:
+      "在 Guardian 旁边未找到 guardian-session.exe，无法注册启动项。请将两个文件放在同一目录。",
+    autostart_failed: "无法修改启动设置。",
+    autostart_on: "Guardian 将在登录时启动，会话助手也会一并启动。",
+    autostart_off: "Guardian 将不再随登录启动。两项启动项均已移除。",
     recovered: "上一次会话非正常结束。状态已恢复；未丢弃任何工作。",
     confirm: "确认",
     cancel: "取消",
@@ -211,11 +238,15 @@ function renderPanel(payload) {
   if (panel.unclean_previous_exit) warnings.push(t("recovered"));
   const warning = el("warning");
   if (warnings.length) {
-    warning.textContent = warnings.join(" ");
+    el("warning-text").textContent = warnings.join(" ");
     warning.hidden = false;
   } else {
     warning.hidden = true;
   }
+
+  // The restart button is offered only when it would actually change something: this process is
+  // not elevated. Showing it otherwise would invite a pointless UAC prompt.
+  show(el("restart-elevated"), !payload.elevated);
 
   setLevel("update-level", panel.update.level, panel.update.label);
   setLevel("restart-level", panel.restart_protection.level, panel.restart_protection.label);
@@ -227,6 +258,7 @@ function renderPanel(payload) {
   show(el("degraded-row"), degraded.length > 0);
   if (degraded.length) el("degraded").textContent = degraded.join(", ");
 
+  renderAutostart();
   renderUpdateDetail(panel.update);
   renderNetwork(panel.network);
   renderAgents(panel);
@@ -316,11 +348,29 @@ function setError(message) {
   }
 }
 
+/*
+ * A one-off message about something the user just did, as opposed to a condition the runtime is
+ * reporting. It has its own element so that a periodic panel refresh, which owns the protection
+ * warnings, cannot leave a stale notice on screen or wipe a real warning away.
+ */
+function setNotice(message) {
+  const banner = el("notice");
+  if (!banner) return;
+  if (message) {
+    banner.textContent = message;
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+    banner.textContent = "";
+  }
+}
+
 async function refresh() {
   const res = await invoke("get_panel");
 
   if (res && res.ok) {
     setError(null);
+    setNotice(null);
     renderPanel(res);
     await renderIncidents();
   } else {
@@ -384,12 +434,109 @@ async function reconnect() {
   await refresh();
 }
 
+/*
+ * The logon-startup toggle.
+ *
+ * Read from the registry rather than from the panel document, because it describes the machine's
+ * configuration rather than the runtime's state. It is refreshed on each panel update so a change
+ * made in Task Manager shows up here too.
+ */
+async function renderAutostart() {
+  const box = el("start-at-logon");
+  if (!box) return;
+  try {
+    const res = await invoke("get_autostart");
+    if (res && res.ok) {
+      box.checked = Boolean(res.enabled);
+      // Offering the toggle when the helper binary is missing would register an entry that fails
+      // silently at every logon, so it is disabled and explained instead.
+      box.disabled = !res.helper_available;
+      show(el("autostart-unavailable"), !res.helper_available);
+    }
+  } catch (e) {
+    box.disabled = true;
+  }
+}
+
+async function toggleAutostart() {
+  const box = el("start-at-logon");
+  const wanted = box.checked;
+  box.disabled = true;
+
+  let res = null;
+  try {
+    res = await invoke("set_autostart", { enabled: wanted });
+  } catch (e) {
+    res = { ok: false, error: String(e) };
+  }
+
+  if (res && res.ok) {
+    box.checked = Boolean(res.enabled);
+    box.disabled = !res.helper_available;
+    setNotice(res.enabled ? t("autostart_on") : t("autostart_off"));
+  } else {
+    // Put the checkbox back where it was: it must reflect the registry, not the click.
+    box.checked = !wanted;
+    box.disabled = false;
+    setError(res && res.error ? res.error : t("autostart_failed"));
+  }
+}
+
+/*
+ * Ask Windows for administrator rights and restart there.
+ *
+ * The main process starts the elevated copy before this one exits, so declining the prompt leaves
+ * the user exactly where they were: still protected, still informed. That ordering is why a
+ * declined prompt is reported as a message rather than an error.
+ */
+async function restartElevated() {
+  const button = el("restart-elevated");
+  button.disabled = true;
+
+  let res = null;
+  try {
+    res = await invoke("restart_elevated");
+  } catch (e) {
+    res = { ok: false, error: String(e) };
+  }
+
+  // On success the process exits within a moment and this page goes with it. Anything written to
+  // the banner now would be discarded anyway, and writing it risks leaving the text behind if the
+  // exit is slower than the next refresh.
+  if (res && res.ok) return;
+
+  // The process is still alive, so nothing changed: the user declined, or it failed. Re-enable the
+  // button and let the next refresh redraw the *true* state from the runtime, rather than leaving
+  // a message that describes an attempt instead of a condition.
+  button.disabled = false;
+
+  if (res && res.declined) {
+    setError(null);
+    // A declined prompt is a choice, not a fault. Say what it means for protection and stop.
+    setNotice(t("elevation_declined"));
+    await refresh();
+    return;
+  }
+
+  const detail = res && res.error ? ` ${res.error}` : "";
+  setError(`${t("elevation_failed")}${detail}`);
+}
+
 /* ------------------------------------------------------------------ wiring */
 
 window.addEventListener("DOMContentLoaded", async () => {
+  // Start from a known state. The markup ships with the elevation banner hidden, and this makes
+  // that explicit rather than relying on the `hidden` attribute surviving every code path: an
+  // elevated session must never show the banner, not even for the moment before the first panel
+  // document arrives.
+  show(el("warning"), false);
+  show(el("restart-elevated"), false);
+
   el("refresh").addEventListener("click", refresh);
   el("reconnect").addEventListener("click", reconnect);
   el("exit-app").addEventListener("click", exitApp);
+  el("restart-elevated").addEventListener("click", restartElevated);
+  el("start-at-logon").addEventListener("change", toggleAutostart);
   // Hiding is the window manager's job; closing the window already hides it, so this just makes
   // the behaviour discoverable.
   el("hide").addEventListener("click", () => window.close());
@@ -400,6 +547,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     const payload = event.payload;
     if (payload && payload.ok) {
       setError(null);
+      // Anything the user was told about an earlier action is superseded by this fresh reading.
+      setNotice(null);
       renderPanel(payload);
     }
   });

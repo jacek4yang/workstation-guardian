@@ -32,7 +32,10 @@ fn check_name(id: &str, lang: Lang) -> String {
         "runtime.reachable" => ("Guardian running", "Guardian 正在运行"),
         "runtime.installation" => ("Installation", "运行环境"),
         "helper.present" => ("Session helper", "会话助手"),
-        "process.elevation" => ("Diagnostic elevation", "诊断权限"),
+        // Named for what it measures, because it is `guardianctl` being described, not Guardian.
+        // As "Diagnostic elevation" it read as a verdict on the running program, which is exactly
+        // the kind of ambiguity that makes an operator chase a problem that is not there.
+        "process.elevation" => ("This tool is elevated", "本工具已提权"),
         "update.protection" => ("Update protection", "更新保护"),
         "update.unapplied" => ("Update policy applied", "更新策略已应用"),
         "update.externally_managed" => ("Conflicting external policy", "外部策略冲突"),
@@ -82,12 +85,12 @@ fn check_detail(id: &str, lang: Lang) -> String {
             "guardian-session.exe 未运行，工作保护模式下的关机将不会被阻止；请设置登录时启动",
         ),
         "elevation.yes" => (
-            "running elevated; the Windows Update policy can be applied",
-            "已提权；可以应用 Windows Update 策略",
+            "this diagnostic is running elevated, so it can read and write machine policy",
+            "本诊断程序以管理员权限运行，可以读写机器策略",
         ),
         "elevation.no" => (
-            "not elevated; the Windows Update policy cannot be applied, so updates are not held back",
-            "未提权；无法应用 Windows Update 策略，因此更新未被抑制",
+            "this diagnostic is not elevated. That does not describe Guardian: check the              'Guardian running' row for whether protection is active",
+            "本诊断程序未提权。这并不代表 Guardian 的状态；请查看“Guardian 正在运行”一项以确认保护是否生效",
         ),
         "network.no_entries" => (
             "no RAS phonebook entries are configured; PPPoE management is not applicable",
@@ -102,8 +105,8 @@ fn check_detail(id: &str, lang: Lang) -> String {
             "尚无配置文件；使用默认值，且默认值会保护更新",
         ),
         "storage.journal_absent" => (
-            "no journal yet; it is created when the service first starts",
-            "尚无恢复日志；服务首次启动时会创建",
+            "no journal yet; it is created when Guardian first starts",
+            "尚无恢复日志；Guardian 首次启动时会创建",
         ),
         other => return other.to_string(),
     };

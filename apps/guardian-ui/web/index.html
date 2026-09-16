@@ -20,7 +20,18 @@
   </header>
 
   <div id="error" class="banner error" hidden></div>
-  <div id="warning" class="banner warn" hidden></div>
+  <!-- One-off feedback about something the user just did. Separate from the warning banner, which
+       reports the runtime's state and is redrawn on every refresh. -->
+  <div id="notice" class="banner" hidden></div>
+  <!--
+    The elevation banner is the one place the panel offers a fix rather than a report. It carries
+    its own button because the action belongs beside the explanation: a user who has just read
+    that updates are not locked should not have to hunt for what to do about it.
+  -->
+  <div id="warning" class="banner warn" hidden>
+    <span id="warning-text"></span>
+    <button id="restart-elevated" data-i18n="restart_elevated" hidden>Restart as administrator</button>
+  </div>
 
   <section aria-labelledby="protection-heading">
     <h2 id="protection-heading" data-i18n="protection">Protection</h2>
@@ -77,6 +88,22 @@
       </p>
       <ul id="candidates-list"></ul>
     </div>
+  </section>
+
+  <section aria-labelledby="settings-heading">
+    <h2 id="settings-heading" data-i18n="settings">Settings</h2>
+    <label class="check">
+      <input type="checkbox" id="start-at-logon" />
+      <span data-i18n="start_at_logon">Start Guardian at logon</span>
+    </label>
+    <p class="muted small" data-i18n="start_at_logon_note">
+      Adds Guardian to your own startup (HKCU). It also starts the session helper, which is what
+      lets Guardian hold a shutdown while work is running. Nothing machine-wide is changed, and
+      turning this off removes both entries.
+    </p>
+    <p id="autostart-unavailable" class="warn small" hidden data-i18n="start_at_logon_unavailable">
+      guardian-session.exe was not found beside Guardian, so startup cannot be registered.
+    </p>
   </section>
 
   <section aria-labelledby="incidents-heading">

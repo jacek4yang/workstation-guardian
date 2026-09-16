@@ -105,6 +105,41 @@ section {
   background: color-mix(in srgb, var(--error) 8%, transparent);
 }
 
+/*
+ * The warning banner can carry an action, so it lays out as text plus an optional button. The
+ * button sits on its own line rather than inline: the sentence it follows is long, and a button
+ * wedged into the middle of it reads as part of the sentence.
+ */
+.banner.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+
+.banner.warn button {
+  display: block;
+  margin-top: 8px;
+}
+
+/* A checkbox and its label on one line, with the explanation below it. */
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent, #1e5cb0);
+}
+
+.check input:disabled + span {
+  opacity: 0.6;
+}
+
 /* Label/value rows: a definition list so the pairing is real, laid out as a grid. */
 .rows {
   margin: 0;

@@ -222,6 +222,100 @@ impl TokenGuard {
     }
 }
 
+/// Restart this program elevated, after the user consents to the UAC prompt.
+///
+/// # Why `runas` rather than a manifest
+///
+/// Guardian could ask for elevation in its manifest, which would prompt at every launch. It does
+/// not, for two reasons: the program is useful unelevated (it reports honestly that it cannot
+/// apply the policy, rather than refusing to start), and a manifest-forced prompt cannot be
+/// explained before it appears.
+///
+/// So elevation is requested on demand, from a button, at a moment when the user has just been
+/// told *why* it is needed.
+///
+/// # What the caller must do
+///
+/// This function only starts the new process. The caller **must** exit the current one on success,
+/// or two copies will run and fight over the pipe, the policy, and the journal. The single-instance
+/// check in the tray app refuses to start a second copy, so the new process would exit immediately
+/// and the user would be left with an unelevated one — the worst outcome, because it looks like
+/// the button did nothing.
+///
+/// Returns `Ok(true)` when the new process was started, `Ok(false)` when the user declined the
+/// prompt, and `Err` for a genuine failure. Declining is not an error: it is a legitimate choice
+/// and must not be reported as a fault.
+pub fn relaunch_elevated() -> Result<bool, WinError> {
+    relaunch_elevated_with(&[] as &[&str])
+}
+
+/// Restart this program elevated, passing extra arguments to the new instance.
+pub fn relaunch_elevated_with(extra_args: &[&str]) -> Result<bool, WinError> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let exe = std::env::current_exe().map_err(|e| WinError::Invalid {
+        context: "could not determine this executable's path",
+        detail: e.to_string(),
+    })?;
+
+    let exe_wide = crate::WideString::new(&exe.to_string_lossy());
+    let verb = crate::WideString::new("runas");
+    let params = if extra_args.is_empty() {
+        None
+    } else {
+        Some(crate::WideString::new(&extra_args.join(" ")))
+    };
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        // NOASYNC is required: without it the process may outlive this function's stack frame,
+        // and `lpParameters` would dangle.
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(exe_wide.as_ptr()),
+        lpParameters: params
+            .as_ref()
+            .map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+
+    // Safety: `info` is fully initialized with a correct `cbSize`, and the wide strings it points
+    // at outlive the call. ShellExecuteExW does not retain them afterwards because NOASYNC is set.
+    let result = unsafe { ShellExecuteExW(&mut info) };
+
+    match result {
+        Ok(()) => {
+            // The handle is ours to close; we do not need to wait on the process.
+            if !info.hProcess.is_invalid() {
+                // Safety: the handle came from ShellExecuteExW and is closed exactly once.
+                unsafe {
+                    let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+                }
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            // ERROR_CANCELLED (1223) is the documented result of the user declining the prompt.
+            // Treating it as a failure would show an error for a deliberate choice.
+            const ERROR_CANCELLED: i32 = 1223;
+            if e.code().0 == ERROR_CANCELLED {
+                Ok(false)
+            } else {
+                Err(WinError::Api {
+                    operation: "ShellExecuteExW(runas)",
+                    code: e.code().0 as u32,
+                    message: crate::format_win_error(e.code().0 as u32),
+                })
+            }
+        }
+    }
+}
+
 impl Drop for TokenGuard {
     fn drop(&mut self) {
         use windows::Win32::Foundation::CloseHandle;
@@ -287,5 +381,24 @@ mod tests {
         drop(guard);
         let again = TokenGuard::current().expect("a second open must still work");
         assert!(!again.raw().is_invalid());
+    }
+
+    #[test]
+    fn the_current_executable_can_be_named() {
+        // `relaunch_elevated` depends on being able to name its own binary. This is the part of it
+        // that can be checked without showing a UAC prompt, which no test may do: a prompt would
+        // block an unattended run and could be dismissed by a stray click.
+        let exe = std::env::current_exe().expect("a test process always knows its own path");
+        assert!(exe.is_absolute());
+        assert!(exe.exists());
+    }
+
+    #[test]
+    fn the_arguments_are_joined_for_the_new_instance() {
+        // The parameters string is passed through verbatim to the new process. A test asserts the
+        // shape the caller relies on, without invoking ShellExecuteExW.
+        let joined = ["--relaunched", "--lang", "zh-CN"].join(" ");
+        assert_eq!(joined, "--relaunched --lang zh-CN");
+        assert_eq!(Vec::<&str>::new().join(" "), "");
     }
 }

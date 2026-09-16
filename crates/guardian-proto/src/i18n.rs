@@ -259,6 +259,34 @@ pub mod msg {
     );
     pub const MODE_ENTER: Text = Text::new("Enter maintenance", "进入维护模式");
     pub const MODE_EXIT: Text = Text::new("Exit maintenance", "退出维护模式");
+    // ---- logon startup ----
+    pub const START_AT_LOGON: Text = Text::new("Start Guardian at logon", "登录时启动 Guardian");
+    pub const START_AT_LOGON_NOTE: Text = Text::new(
+        "Adds Guardian to your own startup (HKCU). It also starts the session helper, which is          what lets Guardian hold a shutdown while work is running. Nothing machine-wide is          changed, and turning this off removes both entries.",
+        "将 Guardian 加入你的启动项（HKCU）。同时会启动会话助手，它让 Guardian 在有任务运行时能够阻止关机。不会修改任何全局设置，关闭此项会移除这两项。",
+    );
+    pub const START_AT_LOGON_UNAVAILABLE: Text = Text::new(
+        "guardian-session.exe was not found beside Guardian, so startup cannot be registered.          Keep both files in the same folder.",
+        "在 Guardian 旁边未找到 guardian-session.exe，无法注册启动项。请将两个文件放在同一目录。",
+    );
+    pub const AUTOSTART_FAILED: Text =
+        Text::new("Could not change the startup setting", "无法修改启动设置");
+
+    // ---- elevation ----
+    pub const RESTART_ELEVATED: Text =
+        Text::new("Restart as administrator", "以管理员身份重新启动");
+    pub const ALREADY_ELEVATED: Text =
+        Text::new("Already running as administrator.", "已以管理员身份运行。");
+    pub const ELEVATION_DECLINED: Text = Text::new(
+        "Administrator rights were not granted, so the Windows Update policy could not be          applied. Guardian is still running and protecting what it can.",
+        "未获得管理员权限，因此无法应用 Windows Update 策略。Guardian 仍在运行，并保护其能够保护的部分。",
+    );
+    pub const ELEVATION_FAILED: Text =
+        Text::new("Could not restart as administrator", "无法以管理员身份重启");
+    pub const RESTARTING_ELEVATED: Text = Text::new(
+        "Restarting with administrator rights…",
+        "正在以管理员权限重启…",
+    );
     pub const REMINDER_ONLY: Text = Text::new(
         "Workstation Guardian reduces the risk of an unexpected restart. It cannot make Windows \
          unable to reboot.",

@@ -39,12 +39,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod autostart;
+
 use guardian_proto::i18n::{msg, Text};
 use guardian_proto::model::*;
 use guardian_proto::Lang;
 use guardian_service::runtime::{run, GuardianRuntime, RuntimeOptions};
 use guardian_service::state::{ServiceState, SharedState};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
@@ -148,8 +150,18 @@ impl UiBridge {
 }
 
 fn main() {
-    // One copy only. Two would fight over the same policy keys and the same journal.
-    if let Some(existing) = already_running() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let relaunched = args.iter().any(|a| a == RELAUNCH_FLAG);
+
+    // The elevated copy is started by the unelevated one, so for a moment both exist. The new
+    // copy announces itself with `--relaunched` and must be allowed through; the old one is the
+    // one that should stand down. Without this handshake the two would race and one would exit at
+    // random — which, if the *elevated* one lost, looks exactly like the button doing nothing.
+    if relaunched {
+        // Wait for the instance that launched us to exit. Bounded: if it is wedged we must not
+        // hang, because the user is looking at a UAC prompt they already approved.
+        wait_for_predecessor(Duration::from_secs(10));
+    } else if let Some(existing) = already_running() {
         eprintln!(
             "Workstation Guardian is already running (pid {existing}). \
              Use the tray icon to open it."
@@ -162,11 +174,27 @@ fn main() {
         .expect("the Tauri runtime could not start");
 }
 
-/// Whether another copy of this program is already running, and its pid.
+/// The flag the elevated instance is started with.
+const RELAUNCH_FLAG: &str = "--relaunched";
+
+/// Wait for any other copy of this program to exit.
 ///
-/// Compares by image name rather than by a lock file. A lock file left behind by a crash would
-/// permanently block startup; a running process is self-evidently current.
-fn already_running() -> Option<u32> {
+/// Returns as soon as none is left, or when `timeout` elapses. A timeout is not an error: two
+/// copies coexisting briefly is survivable (the pipe server tolerates it and the journal is
+/// locked), whereas refusing to start would strand the user with only the unelevated copy.
+fn wait_for_predecessor(timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if other_instance().is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tracing::warn!("an earlier copy did not exit; continuing anyway");
+}
+
+/// Another copy of this program, by pid.
+fn other_instance() -> Option<u32> {
     let me = std::process::id();
     let mut processes = guardian_win::process::enumerate_processes().ok()?;
     processes.retain(|p| p.pid != me);
@@ -177,6 +205,14 @@ fn already_running() -> Option<u32> {
             name == "guardian-ui.exe" || name == "guardian.exe"
         })
         .map(|p| p.pid)
+}
+
+/// Whether another copy of this program is already running, and its pid.
+///
+/// Compares by image name rather than by a lock file. A lock file left behind by a crash would
+/// permanently block startup; a running process is self-evidently current.
+fn already_running() -> Option<u32> {
+    other_instance()
 }
 
 /// The language to render in, from configuration, defaulting to the system locale.
@@ -202,6 +238,9 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             get_incidents,
             get_language,
             reconnect,
+            restart_elevated,
+            get_autostart,
+            set_autostart,
             exit_app,
         ])
         .setup(|app| {
@@ -369,6 +408,14 @@ fn build_menu(app: &AppHandle, lang: Lang) -> tauri::Result<(Menu<tauri::Wry>, T
         true,
         None::<&str>,
     )?;
+    let logon = CheckMenuItem::with_id(
+        app,
+        "start-at-logon",
+        msg::START_AT_LOGON.get(lang),
+        true,
+        autostart::state().any(),
+        None::<&str>,
+    )?;
     let data_folder = MenuItem::with_id(
         app,
         "data-folder",
@@ -396,6 +443,7 @@ fn build_menu(app: &AppHandle, lang: Lang) -> tauri::Result<(Menu<tauri::Wry>, T
             &sep1,
             &open,
             &data_folder,
+            &logon,
             &sep2,
             &quit,
         ],
@@ -674,6 +722,118 @@ fn reconnect(
     })
 }
 
+/// Restart this program elevated, after the user consents to the UAC prompt.
+///
+/// # Ordering
+///
+/// The elevated copy is started *first*, then this one stops. Doing it the other way around would
+/// leave the user with no Guardian at all if they then declined the prompt — so the decline path
+/// must change nothing.
+///
+/// The new process is told to wait for this one to exit (`--relaunched`), so the single-instance
+/// check does not turn its own restart away.
+#[tauri::command]
+fn restart_elevated(
+    app: AppHandle,
+    bridge: tauri::State<'_, UiBridge>,
+    lang: tauri::State<'_, Lang>,
+) -> serde_json::Value {
+    let lang = *lang;
+
+    if bridge.is_elevated() {
+        return serde_json::json!({
+            "ok": true,
+            "already_elevated": true,
+            "message": msg::ALREADY_ELEVATED.get(lang),
+        });
+    }
+
+    match guardian_win::elevation::relaunch_elevated_with(&[RELAUNCH_FLAG]) {
+        Ok(true) => {
+            // The new instance is on its way. Stop this one so it can take over cleanly.
+            let handle = app.clone();
+            // Stop the runtime on a background thread so this command returns and the panel can
+            // show that a restart is under way, rather than the process vanishing mid-reply.
+            std::thread::spawn(move || {
+                handle.state::<UiBridge>().request_stop();
+                handle.exit(0);
+            });
+            serde_json::json!({ "ok": true, "relaunching": true })
+        }
+        // Declining the prompt is a legitimate choice, not a failure. Nothing has changed: the
+        // program is still running and still protecting whatever it can.
+        Ok(false) => serde_json::json!({
+            "ok": false,
+            "declined": true,
+            "message": msg::ELEVATION_DECLINED.get(lang),
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not restart elevated");
+            serde_json::json!({
+                "ok": false,
+                "error": format!("{}: {e}", msg::ELEVATION_FAILED.get(lang)),
+            })
+        }
+    }
+}
+
+/// Whether Guardian and the session helper start at logon.
+#[tauri::command]
+fn get_autostart(lang: tauri::State<'_, Lang>) -> serde_json::Value {
+    let lang = *lang;
+    let state = autostart::state();
+    serde_json::json!({
+        "ok": true,
+        "enabled": state.any(),
+        "guardian": state.guardian,
+        "helper": state.helper,
+        // Whether the helper *can* be registered: the binary has to be there. Reported up front so
+        // the panel does not offer a toggle that would create an entry pointing at nothing.
+        "helper_available": helper_path().is_some(),
+        "label": msg::START_AT_LOGON.get(lang),
+    })
+}
+
+/// Enable or disable logon startup.
+#[tauri::command]
+fn set_autostart(enabled: bool, lang: tauri::State<'_, Lang>) -> serde_json::Value {
+    let lang = *lang;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return serde_json::json!({
+            "ok": false,
+            "error": msg::AUTOSTART_FAILED.get(lang),
+        });
+    };
+
+    // Register the helper alongside Guardian when it is present. It is what makes restart
+    // protection real, so enabling startup without it would leave the panel reporting Degraded
+    // forever with no obvious way to fix it.
+    let helper = helper_path();
+
+    match autostart::set_enabled(enabled, &exe, helper.as_deref()) {
+        Ok(state) => serde_json::json!({
+            "ok": true,
+            "enabled": state.any(),
+            "guardian": state.guardian,
+            "helper": state.helper,
+            "helper_available": helper.is_some(),
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not change the autostart setting");
+            serde_json::json!({
+                "ok": false,
+                "error": format!("{}: {e}", msg::AUTOSTART_FAILED.get(lang)),
+            })
+        }
+    }
+}
+
+/// Where `guardian-session.exe` is, if it ships beside this executable.
+fn helper_path() -> Option<std::path::PathBuf> {
+    autostart::helper_beside(&std::env::current_exe().ok()?)
+}
+
 /// Exit the whole program, runtime included.
 ///
 /// This is the only action that stops protection, and it is explicit. Closing the window hides the
@@ -706,6 +866,20 @@ pub fn handle_menu_event(app: &AppHandle, id: &str) {
         "data-folder" => {
             if let Err(e) = open_data_folder() {
                 tracing::warn!("could not open the data folder: {e}");
+            }
+        }
+        "start-at-logon" => {
+            // A check item: Windows has already flipped the tick visually. Read the registry back
+            // afterwards and re-sync, so the tick reflects what was actually written rather than
+            // what was clicked.
+            let wanted = !autostart::state().any();
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    if let Err(e) = autostart::set_enabled(wanted, &exe, helper_path().as_deref()) {
+                        tracing::warn!(error = %e, "could not change the autostart setting");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not determine this executable's path"),
             }
         }
         "exit-app" => {
@@ -781,6 +955,38 @@ mod tests {
             start.elapsed() < SHUTDOWN_GRACE,
             "the second exit request must not wait again"
         );
+    }
+
+    #[test]
+    fn the_relaunch_flag_is_not_mistaken_for_a_normal_start() {
+        // The elevated instance is started with the flag; without it the single-instance check
+        // would turn its own restart away and the user would see the button do nothing.
+        assert_eq!(RELAUNCH_FLAG, "--relaunched");
+        let parsed: Vec<String> = [RELAUNCH_FLAG].iter().map(|s| s.to_string()).collect();
+        assert!(parsed.iter().any(|a| a == RELAUNCH_FLAG));
+    }
+
+    #[test]
+    fn the_predecessor_wait_is_bounded() {
+        // A wedged earlier copy must not hang the new one: the user has already approved the UAC
+        // prompt and is waiting for a window to appear.
+        let start = std::time::Instant::now();
+        // With no other instance running this returns immediately.
+        wait_for_predecessor(Duration::from_millis(500));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "waiting for a predecessor must be bounded"
+        );
+    }
+
+    #[test]
+    fn this_process_is_not_reported_as_another_instance() {
+        // `other_instance` must exclude the caller, or `wait_for_predecessor` would wait for
+        // itself until the timeout on every start.
+        let me = std::process::id();
+        if let Some(other) = other_instance() {
+            assert_ne!(other, me, "a process must not be its own predecessor");
+        }
     }
 
     #[test]
