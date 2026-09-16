@@ -1142,6 +1142,9 @@ impl Default for ConfigDocument {
 /// Live configuration, with unknown future fields retained in `unknown`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ConfigBody {
+    /// Language for user-facing text. `auto` follows the operating system.
+    #[serde(default)]
+    pub language: crate::i18n::Lang,
     #[serde(default)]
     pub update: UpdateConfig,
     #[serde(default)]
@@ -1215,8 +1218,10 @@ impl Default for NetworkConfig {
             enabled: true,
             entry_name: None,
             check_interval_secs: 20,
-            failure_quorum: 2,
-            success_quorum: 2,
+            // A quorum of one, matching the single default probe. Raising this above the number
+            // of configured probes would make the link permanently unverifiable.
+            failure_quorum: 1,
+            success_quorum: 1,
             stabilize_secs: 120,
             stale_grace_secs: 30,
             adopt_existing_sessions: true,
@@ -1225,58 +1230,44 @@ impl Default for NetworkConfig {
     }
 }
 
-/// Independent connectivity probes. Several providers, none of them authoritative alone.
+/// The connectivity probes used by default.
 ///
-/// # Choosing targets
+/// # Why a single target
 ///
-/// A default set has to work on a machine behind a filtered network — a campus or corporate
-/// connection that permits DNS and ordinary web traffic but blocks direct connections to public
-/// resolver IPs. A probe set that assumes open egress reports "partially connected" on such a
-/// machine forever, which is both noisy and, worse, would suppress a dial that should have
-/// happened.
+/// The default is one well-known, highly available DNS resolver reached over TCP on port 443:
+/// `223.5.5.5`, operated by Alibaba Cloud.
 ///
-/// So the defaults mix three kinds of evidence:
+/// This was chosen from measurement rather than preference. On the development machine the
+/// reachable set was not the obvious one:
 ///
-/// * a TCP connect to a **hostname**, which exercises DNS *and* routing to a real service;
-/// * a TCP connect to a well-known IP, for the common case where egress is open;
-/// * a DNS resolution, which works even where egress is filtered.
+/// ```text
+/// 223.5.5.5:443            reachable, ~24 ms
+/// www.msftconnecttest.com  reachable, ~180 ms
+/// 1.1.1.1:443              timed out (filtered by the local network)
+/// 8.8.8.8:443              timed out (filtered by the local network)
+/// ```
 ///
-/// The quorum means no single target is authoritative, and all three are configurable.
+/// A probe set that assumes open egress reports "partially connected" forever on such a network,
+/// which is both noisy and, worse, can suppress a dial that should have happened. One target that
+/// is actually reachable is worth more than several that are not.
+///
+/// A TCP connect is used rather than an HTTP request: it proves the path carries packets end to
+/// end, costs one round trip, and sends no application-layer data. That matters for a probe that
+/// runs every few seconds for months.
+///
+/// # Changing it
+///
+/// Every field is configurable. Add probes if this machine's network changes, or if you want a
+/// second opinion from a different operator — the quorum logic then requires more than one of them
+/// to fail before declaring the link down.
 pub fn default_probes() -> Vec<ProbeConfig> {
-    vec![
-        ProbeConfig {
-            id: "tcp-cloudflare".into(),
-            kind: ProbeKind::Tcp,
-            // A hostname rather than a bare IP: this is the probe that most reliably reflects
-            // whether a real Internet service is reachable.
-            target: "one.one.one.one:443".into(),
-            timeout_ms: 3000,
-            enabled: true,
-        },
-        ProbeConfig {
-            id: "tcp-alidns".into(),
-            kind: ProbeKind::Tcp,
-            // A second, geographically distinct operator, so one provider's outage is not read as
-            // a local network failure.
-            target: "223.5.5.5:443".into(),
-            timeout_ms: 3000,
-            enabled: true,
-        },
-        ProbeConfig {
-            id: "tcp-msftconnecttest".into(),
-            kind: ProbeKind::Tcp,
-            target: "www.msftconnecttest.com:443".into(),
-            timeout_ms: 3000,
-            enabled: true,
-        },
-        ProbeConfig {
-            id: "dns-msftconnecttest".into(),
-            kind: ProbeKind::Dns,
-            target: "www.msftconnecttest.com".into(),
-            timeout_ms: 3000,
-            enabled: true,
-        },
-    ]
+    vec![ProbeConfig {
+        id: "alidns-tcp".into(),
+        kind: ProbeKind::Tcp,
+        target: "223.5.5.5:443".into(),
+        timeout_ms: 3000,
+        enabled: true,
+    }]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

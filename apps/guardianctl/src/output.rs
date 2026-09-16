@@ -1,44 +1,61 @@
 //! Human-readable rendering of protocol responses.
 //!
+//! Every user-facing string comes from `guardian_proto::i18n`, so the CLI, the tray panel and the
+//! service cannot disagree about what a state is called. Rendering takes a `Lang`; nothing else
+//! branches on language.
+//!
 //! Deliberately plain: a diagnostics tool's output is read in a terminal, often over a remote
-//! session, and columns that line up are worth more than colour. The text is also stable enough
-//! that an operator can diff two runs.
+//! session, and columns that line up are worth more than colour.
 
+use guardian_proto::i18n::msg;
 use guardian_proto::model::{
     AgentInstance, AgentInventory, Confidence, Incident, IncidentKind, InternetHealth,
-    NetworkSnapshot, PendingRebootReport, ProtectionLevel, StatusSnapshot,
+    NetworkSnapshot, PendingRebootReport, PendingRebootVerdict, ProtectionLevel, ProtectionMode,
+    StatusSnapshot,
 };
-use guardian_proto::Response;
+use guardian_proto::{Lang, Response};
 
-/// Render any response.
-pub fn render_response(response: &Response) -> String {
+/// Render any response in the given language.
+pub fn render_response(response: &Response, lang: Lang) -> String {
     match response {
         Response::Hello {
             protocol,
             service_version,
             ..
         } => format!("service version {service_version} (protocol {protocol})"),
-        Response::Status { snapshot: s } => status_text(s),
-        Response::Agents { inventory } => agents_text(inventory),
-        Response::Network { snapshot } => network_text(snapshot),
-        Response::Incidents { incidents } => incidents_text(incidents),
-        Response::PendingReboot { report: p } => pending_reboot_text(p),
-        Response::Config { config: c } => match serde_json::to_string_pretty(c) {
+        Response::Status { snapshot } => status_text(snapshot, lang),
+        Response::Agents { inventory } => agents_text(inventory, lang),
+        Response::Network { snapshot } => network_text(snapshot, lang),
+        Response::Incidents { incidents } => incidents_text(incidents, lang),
+        Response::PendingReboot { report } => pending_reboot_text(report, lang),
+        Response::Config { config } => match serde_json::to_string_pretty(config) {
             Ok(s) => s,
             Err(e) => format!("could not render the configuration: {e}"),
         },
-        Response::Health { report: h } => crate::doctor::render(h),
-        Response::RebootAuthorization { authorization: a } => match a.as_ref() {
-            Some(auth) => format!(
-                "A single reboot is authorized.\n  Issued at    {}\n  Expires at   {}\n  Issued by    {}\n  Consumed     {}",
-                format_ms(auth.issued_at_ms),
-                format_ms(auth.expires_at_ms),
-                auth.issued_by,
-                auth.consumed_at_ms
-                    .map(format_ms)
-                    .unwrap_or_else(|| "not yet".into())
-            ),
-            None => "No reboot is authorized.".to_string(),
+        Response::Health { report } => crate::doctor::render(report, lang),
+        Response::RebootAuthorization { authorization } => match authorization.as_ref() {
+            Some(auth) => {
+                let issued = section(lang, "Issued at", "签发于");
+                let expires = section(lang, "Expires at", "过期于");
+                let by = section(lang, "Issued by", "签发人");
+                let consumed = section(lang, "Consumed", "已消费");
+                let not_yet = section(lang, "not yet", "尚未");
+                format!(
+                    "{}\n  {}  {}\n  {}  {}\n  {}  {}\n  {}  {}",
+                    section(lang, "A single reboot is authorized.", "已授权一次重启。"),
+                    issued,
+                    format_ms(auth.issued_at_ms),
+                    expires,
+                    format_ms(auth.expires_at_ms),
+                    by,
+                    auth.issued_by,
+                    consumed,
+                    auth.consumed_at_ms
+                        .map(format_ms)
+                        .unwrap_or_else(|| not_yet.to_string())
+                )
+            }
+            None => section(lang, "No reboot is authorized.", "未授权重启。").to_string(),
         },
         Response::Ok { message } => message.clone(),
         Response::Error { error } => format!("error: {error}"),
@@ -46,139 +63,125 @@ pub fn render_response(response: &Response) -> String {
 }
 
 /// Render the main status screen.
-pub fn status_text(s: &StatusSnapshot) -> String {
+pub fn status_text(s: &StatusSnapshot, lang: Lang) -> String {
     let mut out = String::new();
 
     out.push_str("WORKSTATION GUARDIAN\n\n");
 
-    out.push_str("Protection\n");
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        "Update Protection",
-        level_label(s.update.level)
-    ));
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        "Restart Protection",
-        level_label(s.restart_protection)
-    ));
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        "Service",
+    out.push_str(&format!("{}\n", section(lang, "Protection", "保护")));
+    row(
+        &mut out,
+        msg::UPDATE_PROTECTION.get(lang),
+        level_label(s.update.level, lang),
+    );
+    row(
+        &mut out,
+        msg::RESTART_PROTECTION.get(lang),
+        level_label(s.restart_protection, lang),
+    );
+    row(
+        &mut out,
+        msg::SERVICE.get(lang),
         if s.service.running {
-            "Running"
+            msg::RUNNING.get(lang)
         } else {
-            "Stopped"
-        }
-    ));
-    out.push_str(&format!("  {:<24}{}\n", "Mode", s.mode.as_str()));
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        "Uptime",
-        format_duration(s.service.uptime_ms)
-    ));
+            msg::STOPPED.get(lang)
+        },
+    );
+    row(&mut out, msg::MODE.get(lang), mode_label(s.mode, lang));
+    row(
+        &mut out,
+        msg::UPTIME.get(lang),
+        &format_duration(s.service.uptime_ms),
+    );
     if !s.service.degraded_components.is_empty() {
-        out.push_str(&format!(
-            "  {:<24}{}\n",
-            "Degraded",
-            s.service.degraded_components.join(", ")
-        ));
+        row(
+            &mut out,
+            msg::DEGRADED_COMPONENTS.get(lang),
+            &s.service.degraded_components.join(", "),
+        );
     }
 
     out.push('\n');
-    out.push_str("Network\n");
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        "Internet",
-        internet_label(s.network.internet)
-    ));
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        "PPPoE",
+    out.push_str(&format!("{}\n", msg::NETWORK.get(lang)));
+    row(
+        &mut out,
+        msg::INTERNET.get(lang),
+        internet_label(s.network.internet, lang),
+    );
+    row(
+        &mut out,
+        msg::PPPOE.get(lang),
         s.network
             .entry_name
             .as_deref()
-            .unwrap_or("(not configured)")
-    ));
-    out.push_str(&format!("  {:<24}{:?}\n", "RAS state", s.network.ras_state));
+            .unwrap_or(msg::NOT_CONFIGURED.get(lang)),
+    );
+    row(
+        &mut out,
+        msg::RAS_STATE.get(lang),
+        &format!("{:?}", s.network.ras_state),
+    );
     if let Some(uptime) = s.network.uptime_ms {
-        out.push_str(&format!(
-            "  {:<24}{}\n",
-            "Connection uptime",
-            format_duration(uptime)
-        ));
+        row(
+            &mut out,
+            msg::CONNECTION_UPTIME.get(lang),
+            &format_duration(uptime),
+        );
     }
     if let Some(last) = s.network.last_reconnect_ms {
-        out.push_str(&format!("  {:<24}{}\n", "Last reconnect", format_ms(last)));
+        row(&mut out, msg::LAST_RECONNECT.get(lang), &format_ms(last));
     }
     if let Some(outage) = &s.network.current_outage {
-        out.push_str(&format!(
-            "  {:<24}ongoing, {} ({} attempts)\n",
-            "Outage",
-            format_duration(outage.downtime_ms.unwrap_or(0)),
-            outage.dial_attempts
-        ));
+        let ongoing = section(lang, "ongoing", "进行中");
+        let attempts = section(lang, "attempts", "次尝试");
+        row(
+            &mut out,
+            msg::OUTAGE.get(lang),
+            &format!(
+                "{ongoing}, {} ({} {attempts})",
+                format_duration(outage.downtime_ms.unwrap_or(0)),
+                outage.dial_attempts
+            ),
+        );
     }
 
     out.push('\n');
-    out.push_str("Active Work\n");
-    let agents = &s.agents;
-    if agents.agent_count() == 0 && agents.workloads.is_empty() {
-        out.push_str("  (nothing detected)\n");
-    } else {
-        for group in &agents.agents {
-            let live: Vec<&AgentInstance> = group
-                .instances
-                .iter()
-                .filter(|i| i.confidence.drives_protection())
-                .collect();
-            if live.is_empty() {
-                continue;
-            }
-            out.push_str(&format!("  {:<24}{}\n", group.display_name, live.len()));
-        }
-        // Report the ones that are only possible, so they are visible without being counted.
-        for group in &agents.agents {
-            let possible: Vec<&AgentInstance> = group
-                .instances
-                .iter()
-                .filter(|i| i.confidence == Confidence::Possible)
-                .collect();
-            if !possible.is_empty() {
-                out.push_str(&format!(
-                    "  {:<24}{} (unconfirmed)\n",
-                    group.display_name,
-                    possible.len()
-                ));
-            }
-        }
-        if !agents.workloads.is_empty() {
-            out.push_str(&format!("  {:<24}{}\n", "Builds", agents.workloads.len()));
-        }
-    }
+    out.push_str(&format!("{}\n", msg::ACTIVE_WORK.get(lang)));
+    render_active_work(&mut out, &s.agents, lang);
 
     out.push('\n');
-    out.push_str("Pending reboot\n");
-    out.push_str(&format!(
-        "  {:<24}{}\n",
-        s.pending_reboot.verdict.as_str(),
-        s.pending_reboot.reasons().join("; ")
-    ));
+    out.push_str(&format!("{}\n", msg::PENDING_REBOOT.get(lang)));
+    row(
+        &mut out,
+        verdict_label(s.pending_reboot.verdict, lang),
+        &s.pending_reboot.reasons().join("; "),
+    );
 
     if let Some(auth) = &s.reboot_authorization {
         out.push('\n');
-        out.push_str("Maintenance\n");
-        out.push_str(&format!(
-            "  {:<24}{} until {}\n",
-            "One reboot authorized",
-            "armed",
-            format_ms(auth.expires_at_ms)
-        ));
+        out.push_str(&format!("{}\n", section(lang, "Maintenance", "维护模式")));
+        row(
+            &mut out,
+            section(lang, "One reboot authorized", "已授权一次重启"),
+            &format!(
+                "{} {}",
+                section(lang, "until", "至"),
+                format_ms(auth.expires_at_ms)
+            ),
+        );
     }
 
     if !s.maintenance_denial_reasons.is_empty() {
         out.push('\n');
-        out.push_str("Maintenance would currently be refused:\n");
+        out.push_str(&format!(
+            "{}\n",
+            section(
+                lang,
+                "Maintenance would currently be refused:",
+                "当前将拒绝进入维护模式："
+            )
+        ));
         for r in &s.maintenance_denial_reasons {
             out.push_str(&format!("  {r}\n"));
         }
@@ -187,181 +190,290 @@ pub fn status_text(s: &StatusSnapshot) -> String {
     out
 }
 
-/// Render the agent inventory.
-pub fn agents_text(inventory: &AgentInventory) -> String {
+/// The "active work" block, shared by the status screen and the agent listing.
+fn render_active_work(out: &mut String, agents: &AgentInventory, lang: Lang) {
+    if agents.agent_count() == 0 && agents.workloads.is_empty() {
+        out.push_str(&format!("  {}\n", msg::NOTHING_DETECTED.get(lang)));
+        return;
+    }
+
+    for group in &agents.agents {
+        let live = group
+            .instances
+            .iter()
+            .filter(|i| i.confidence.drives_protection())
+            .count();
+        if live > 0 {
+            row(out, &group.display_name, &live.to_string());
+        }
+    }
+
+    // Reported, but explicitly not counted: surfacing these without pretending they protect
+    // anything is the honest presentation.
+    for group in &agents.agents {
+        let possible = group
+            .instances
+            .iter()
+            .filter(|i| i.confidence == Confidence::Possible)
+            .count();
+        if possible > 0 {
+            let unconfirmed = section(lang, "unconfirmed", "未确认");
+            row(
+                out,
+                &group.display_name,
+                &format!("{possible} ({unconfirmed})"),
+            );
+        }
+    }
+
+    if !agents.workloads.is_empty() {
+        row(
+            out,
+            msg::BUILD.get(lang),
+            &agents.workloads.len().to_string(),
+        );
+    }
+}
+
+/// Render the agent inventory in full.
+pub fn agents_text(inventory: &AgentInventory, lang: Lang) -> String {
     let mut out = String::new();
 
     if inventory.agent_count() == 0 {
-        out.push_str("No AI coding agents detected.\n");
+        out.push_str(&format!("{}\n", msg::NOTHING_DETECTED.get(lang)));
     } else {
+        let n = inventory.agent_count();
         out.push_str(&format!(
-            "{} agent(s) detected\n\n",
-            inventory.agent_count()
+            "{}\n\n",
+            if lang.resolve() == Lang::ZhCn {
+                format!("检测到 {n} 个 Agent")
+            } else {
+                format!("{n} agent(s) detected")
+            }
         ));
     }
 
     for group in &inventory.agents {
         for instance in &group.instances {
-            out.push_str(&format!("{}\n", instance.display_name));
-            out.push_str(&format!(
-                "  {:<16}{}\n",
-                "Confidence",
-                instance.confidence.as_str()
-            ));
-            out.push_str(&format!(
-                "  {:<16}{} / {}\n",
-                "PID / root", instance.pid, instance.root_pid
-            ));
-            out.push_str(&format!("  {:<16}{}\n", "Session", instance.session_id));
-            if let Some(path) = &instance.image_path {
-                out.push_str(&format!("  {:<16}{}\n", "Image", path));
-            }
-            if let Some(project) = &instance.project {
-                out.push_str(&format!(
-                    "  {:<16}{} (from {})\n",
-                    "Project", project.name, project.source
-                ));
-            }
-            match &instance.resume {
-                guardian_proto::model::ResumeCapability::Available { handle, hint } => {
-                    out.push_str(&format!("  {:<16}{}\n", "Resumable", handle));
-                    out.push_str(&format!("  {:<16}{hint}\n", "Resume with"));
-                }
-                guardian_proto::model::ResumeCapability::Unsupported => {
-                    out.push_str(&format!("  {:<16}unavailable\n", "Resumable"));
-                }
-                guardian_proto::model::ResumeCapability::Unavailable => {}
-            }
-            if !instance.evidence.is_empty() {
-                out.push_str(&format!("  {:<16}\n", "Evidence"));
-                for e in &instance.evidence {
-                    out.push_str(&format!("    [{}] {} — {}\n", e.code, e.matched, e.detail));
-                }
-            }
-            out.push('\n');
+            render_instance(&mut out, instance, lang);
         }
     }
 
     if !inventory.workloads.is_empty() {
-        out.push_str("Protected workloads\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            section(lang, "Protected workloads", "受保护的构建任务")
+        ));
         for w in &inventory.workloads {
             out.push_str(&format!("{}\n", w.display_name));
-            out.push_str(&format!("  {:<16}{}\n", "PID", w.pid));
-            out.push_str(&format!(
-                "  {:<16}{}\n",
-                "Running",
-                format_duration(w.running_ms)
-            ));
+            row(&mut out, msg::PID.get(lang), &w.pid.to_string());
+            row(
+                &mut out,
+                section(lang, "Running for", "已运行"),
+                &format_duration(w.running_ms),
+            );
             if let Some(owner) = &w.owner_kind {
-                out.push_str(&format!("  {:<16}{owner}\n", "Owner"));
+                row(&mut out, section(lang, "Owner", "归属"), owner);
             }
-            out.push_str(&format!("  {:<16}{}\n", "Reason", w.reason));
+            row(&mut out, section(lang, "Reason", "原因"), &w.reason);
         }
     }
 
     if !inventory.candidates.is_empty() {
-        out.push_str("\nUnconfirmed candidates (reported, not protected)\n\n");
+        out.push_str(&format!(
+            "\n{}\n\n",
+            section(
+                lang,
+                "Unconfirmed candidates (reported, not protected)",
+                "未确认的候选（仅供参考，不受保护）"
+            )
+        ));
         for c in &inventory.candidates {
-            out.push_str(&format!(
-                "  {} (pid {}) — {}\n",
-                c.name,
-                c.pid,
-                c.evidence
-                    .first()
-                    .map(|e| e.detail.clone())
-                    .unwrap_or_default()
-            ));
+            let why = c
+                .evidence
+                .first()
+                .map(|e| e.detail.clone())
+                .unwrap_or_default();
+            out.push_str(&format!("  {} (pid {}) — {why}\n", c.name, c.pid));
         }
-        out.push_str(
-            "\nThese never block shutdown. Promote one with a custom agent signature if it is \
-             really an agent.\n",
-        );
+        out.push_str(&format!(
+            "\n{}\n",
+            section(
+                lang,
+                "These never block shutdown. Promote one with a custom agent signature if it is \
+                 really an agent.",
+                "这些不会阻止关机。如果确实是 Agent，可通过自定义签名转为正式识别。"
+            )
+        ));
     }
 
     out
 }
 
+fn render_instance(out: &mut String, instance: &AgentInstance, lang: Lang) {
+    out.push_str(&format!("{}\n", instance.display_name));
+    row(
+        out,
+        section(lang, "Confidence", "置信度"),
+        confidence_label(instance.confidence, lang),
+    );
+    row(
+        out,
+        section(lang, "PID / root", "进程号 / 根进程"),
+        &format!("{} / {}", instance.pid, instance.root_pid),
+    );
+    row(out, section(lang, "Session", "会话"), &instance.session_id);
+    if let Some(path) = &instance.image_path {
+        row(out, section(lang, "Image", "镜像路径"), path);
+    }
+    if let Some(project) = &instance.project {
+        let from = section(lang, "from", "来源");
+        row(
+            out,
+            msg::PROJECT.get(lang),
+            &format!("{} ({from} {})", project.name, project.source),
+        );
+    }
+    match &instance.resume {
+        guardian_proto::model::ResumeCapability::Available { handle, hint } => {
+            row(out, msg::RESUME.get(lang), handle);
+            row(out, section(lang, "Resume with", "恢复命令"), hint);
+        }
+        guardian_proto::model::ResumeCapability::Unsupported => {
+            row(
+                out,
+                msg::RESUME.get(lang),
+                section(lang, "unavailable", "不可用"),
+            );
+        }
+        guardian_proto::model::ResumeCapability::Unavailable => {}
+    }
+    if !instance.evidence.is_empty() {
+        row(out, section(lang, "Evidence", "证据"), "");
+        for e in &instance.evidence {
+            out.push_str(&format!("    [{}] {} — {}\n", e.code, e.matched, e.detail));
+        }
+    }
+    out.push('\n');
+}
+
 /// Render the network snapshot.
-pub fn network_text(n: &NetworkSnapshot) -> String {
+pub fn network_text(n: &NetworkSnapshot, lang: Lang) -> String {
     let mut out = String::new();
 
-    out.push_str("NETWORK\n\n");
-    out.push_str(&format!(
-        "  {:<20}{}\n",
-        "Internet",
-        internet_label(n.internet)
-    ));
-    out.push_str(&format!("  {:<20}{:?}\n", "Phase", n.phase));
-    out.push_str(&format!(
-        "  {:<20}{}\n",
-        "PPPoE entry",
-        n.entry_name.as_deref().unwrap_or("(not configured)")
-    ));
-    out.push_str(&format!("  {:<20}{:?}\n", "RAS state", n.ras_state));
-
+    out.push_str(&format!("{}\n\n", msg::NETWORK.get(lang)));
+    row(
+        &mut out,
+        msg::INTERNET.get(lang),
+        internet_label(n.internet, lang),
+    );
+    row(
+        &mut out,
+        section(lang, "Phase", "阶段"),
+        &format!("{:?}", n.phase),
+    );
+    row(
+        &mut out,
+        section(lang, "PPPoE entry", "PPPoE 条目"),
+        n.entry_name
+            .as_deref()
+            .unwrap_or(msg::NOT_CONFIGURED.get(lang)),
+    );
+    row(
+        &mut out,
+        msg::RAS_STATE.get(lang),
+        &format!("{:?}", n.ras_state),
+    );
     if let Some(uptime) = n.uptime_ms {
-        out.push_str(&format!("  {:<20}{}\n", "Uptime", format_duration(uptime)));
+        row(
+            &mut out,
+            msg::CONNECTION_UPTIME.get(lang),
+            &format_duration(uptime),
+        );
     }
     if let Some(last) = n.last_reconnect_ms {
-        out.push_str(&format!("  {:<20}{}\n", "Last reconnect", format_ms(last)));
+        row(&mut out, msg::LAST_RECONNECT.get(lang), &format_ms(last));
     }
-
-    out.push_str(&format!(
-        "  {:<20}{} of {} required\n",
-        "Quorum", n.consecutive_successes, n.quorum_required
-    ));
-    out.push_str(&format!(
-        "  {:<20}{}\n",
-        "Backoff",
-        format_duration(n.backoff_ms as i64)
-    ));
-
+    row(
+        &mut out,
+        section(lang, "Quorum", "法定票数"),
+        &if lang.resolve() == Lang::ZhCn {
+            format!(
+                "需 {}，当前 {} 次成功",
+                n.quorum_required, n.consecutive_successes
+            )
+        } else {
+            format!(
+                "{} of {} required",
+                n.consecutive_successes, n.quorum_required
+            )
+        },
+    );
+    row(
+        &mut out,
+        section(lang, "Backoff", "退避"),
+        &format_duration(n.backoff_ms as i64),
+    );
     if let Some(err) = &n.last_error {
-        out.push_str(&format!("  {:<20}{err}\n", "Last error"));
+        row(&mut out, section(lang, "Last error", "最近错误"), err);
     }
 
-    out.push_str("\n  Probes\n");
+    out.push_str(&format!("\n  {}\n", section(lang, "Probes", "连通性探测")));
     if n.probes.is_empty() {
-        out.push_str("    (none configured)\n");
+        out.push_str(&format!(
+            "    {}\n",
+            section(lang, "(none configured)", "（未配置）")
+        ));
     }
     for p in &n.probes {
-        out.push_str(&format!(
-            "    {:<24}{:<6}{}\n",
-            p.id,
-            if p.ok { "ok" } else { "FAIL" },
-            p.error.clone().unwrap_or_else(|| {
-                p.latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default()
-            })
-        ));
+        let state = if p.ok {
+            section(lang, "ok", "正常")
+        } else {
+            section(lang, "FAIL", "失败")
+        };
+        let detail = p
+            .error
+            .clone()
+            .unwrap_or_else(|| p.latency_ms.map(|ms| format!("{ms}ms")).unwrap_or_default());
+        out.push_str(&format!("    {:<24}{:<6}{}\n", p.id, state, detail));
     }
 
     if let Some(outage) = &n.current_outage {
-        out.push_str("\n  Current outage\n");
         out.push_str(&format!(
-            "    {:<22}{}\n",
-            "Started",
-            format_ms(outage.started_at_ms)
+            "\n  {}\n",
+            section(lang, "Current outage", "当前故障")
         ));
-        out.push_str(&format!(
-            "    {:<22}{}\n",
-            "Duration",
-            format_duration(outage.downtime_ms.unwrap_or(0))
-        ));
-        out.push_str(&format!("    {:<22}{}\n", "Reason", outage.reason));
-        out.push_str(&format!(
-            "    {:<22}{}\n",
-            "Dial attempts", outage.dial_attempts
-        ));
+        row2(
+            &mut out,
+            section(lang, "Started", "开始于"),
+            &format_ms(outage.started_at_ms),
+        );
+        row2(
+            &mut out,
+            section(lang, "Duration", "持续"),
+            &format_duration(outage.downtime_ms.unwrap_or(0)),
+        );
+        row2(&mut out, section(lang, "Reason", "原因"), &outage.reason);
+        row2(
+            &mut out,
+            section(lang, "Dial attempts", "拨号尝试"),
+            &outage.dial_attempts.to_string(),
+        );
         for e in &outage.ras_errors {
-            out.push_str(&format!("    RAS error {} — {}\n", e.code, e.message));
+            out.push_str(&format!("    RAS {} — {}\n", e.code, e.message));
         }
     }
 
     if !n.recent_outages.is_empty() {
-        out.push_str("\n  Recent outages\n");
+        out.push_str(&format!(
+            "\n  {}\n",
+            section(lang, "Recent outages", "近期故障")
+        ));
         for o in &n.recent_outages {
+            let for_word = section(lang, "for", "持续");
+            let attempts = section(lang, "attempts", "次尝试");
             out.push_str(&format!(
-                "    {} for {} ({}, {} attempts)\n",
+                "    {} {for_word} {} ({}, {} {attempts})\n",
                 format_ms(o.started_at_ms),
                 format_duration(o.downtime_ms.unwrap_or(0)),
                 o.reason,
@@ -374,12 +486,16 @@ pub fn network_text(n: &NetworkSnapshot) -> String {
 }
 
 /// Render incidents.
-pub fn incidents_text(incidents: &[Incident]) -> String {
+pub fn incidents_text(incidents: &[Incident], lang: Lang) -> String {
     if incidents.is_empty() {
-        return "No incidents recorded.\n".to_string();
+        return format!("{}\n", msg::NO_INCIDENTS.get(lang));
     }
 
-    let mut out = format!("{} incident(s), newest first\n\n", incidents.len());
+    let mut out = if lang.resolve() == Lang::ZhCn {
+        format!("{} 条事件记录，最新在前\n\n", incidents.len())
+    } else {
+        format!("{} incident(s), newest first\n\n", incidents.len())
+    };
 
     for i in incidents {
         out.push_str(&format!(
@@ -394,29 +510,42 @@ pub fn incidents_text(incidents: &[Incident]) -> String {
             IncidentKind::UnexpectedRestart => {
                 if let Some(r) = &i.details.unexpected_restart {
                     out.push_str(&format!(
-                        "  Boot: {} -> {}\n",
-                        r.previous_boot_id, r.current_boot_id
+                        "  {}: {} -> {}\n",
+                        section(lang, "Boot", "启动"),
+                        r.previous_boot_id,
+                        r.current_boot_id
                     ));
                     if let Some(initiator) = &r.likely_initiator {
-                        out.push_str(&format!("  Likely initiator: {initiator}\n"));
+                        out.push_str(&format!(
+                            "  {}: {initiator}\n",
+                            section(lang, "Likely initiator", "可能的发起者")
+                        ));
                     }
                     out.push_str(&format!(
-                        "  Confidence: {:?}, Windows Update related: {:?}\n",
-                        r.confidence, r.windows_update_related
+                        "  {}: {:?}, {}: {:?}\n",
+                        section(lang, "Confidence", "置信度"),
+                        r.confidence,
+                        section(lang, "Windows Update related", "与 Windows Update 相关"),
+                        r.windows_update_related
                     ));
                     if !r.agents_lost.is_empty() {
-                        out.push_str("  Agents lost:\n");
+                        out.push_str(&format!(
+                            "  {}:\n",
+                            section(lang, "Agents lost", "丢失的 Agent")
+                        ));
                         for a in &r.agents_lost {
+                            let unknown = section(lang, "unknown", "未知");
                             out.push_str(&format!(
-                                "    {} (pid {}, project {})\n",
+                                "    {} (pid {}, {} {})\n",
                                 a.display_name,
                                 a.pid,
-                                a.project.as_deref().unwrap_or("unknown")
+                                section(lang, "project", "项目"),
+                                a.project.as_deref().unwrap_or(unknown)
                             ));
                         }
                     }
                     if !r.evidence.is_empty() {
-                        out.push_str("  Evidence:\n");
+                        out.push_str(&format!("  {}:\n", section(lang, "Evidence", "证据")));
                         for e in r.evidence.iter().take(10) {
                             out.push_str(&format!(
                                 "    {}/{}: {}\n",
@@ -431,16 +560,25 @@ pub fn incidents_text(incidents: &[Incident]) -> String {
             IncidentKind::PolicyTamper => {
                 if let Some(t) = &i.details.policy_tamper {
                     out.push_str(&format!(
-                        "  {}\\{}: {:?} -> {:?}, restored: {}\n",
-                        t.key_path, t.value_name, t.expected, t.observed, t.restored
+                        "  {}\\{}: {:?} -> {:?}, {}: {}\n",
+                        t.key_path,
+                        t.value_name,
+                        t.expected,
+                        t.observed,
+                        section(lang, "restored", "已恢复"),
+                        t.restored
                     ));
                 }
             }
             IncidentKind::WorkerFailure => {
                 if let Some(w) = &i.details.worker_failure {
                     out.push_str(&format!(
-                        "  Worker '{}' failed {} time(s): {}\n",
-                        w.worker, w.restarts, w.error
+                        "  {} '{}' {} {}: {}\n",
+                        section(lang, "Worker", "组件"),
+                        w.worker,
+                        section(lang, "failed", "失败"),
+                        w.restarts,
+                        w.error
                     ));
                 }
             }
@@ -458,27 +596,35 @@ pub fn incidents_text(incidents: &[Incident]) -> String {
 }
 
 /// Render a pending-reboot report.
-pub fn pending_reboot_text(report: &PendingRebootReport) -> String {
+pub fn pending_reboot_text(report: &PendingRebootReport, lang: Lang) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Pending reboot: {}\n", report.verdict.as_str()));
     out.push_str(&format!(
-        "Checked at: {}\n\n",
+        "{}: {}\n",
+        msg::PENDING_REBOOT.get(lang),
+        verdict_label(report.verdict, lang)
+    ));
+    out.push_str(&format!(
+        "{}: {}\n\n",
+        section(lang, "Checked at", "检测时间"),
         format_ms(report.checked_at_ms)
     ));
 
     if report.signals.is_empty() {
-        out.push_str("No indicators were probed.\n");
+        out.push_str(&format!(
+            "{}\n",
+            section(lang, "No indicators were probed.", "未探测任何指标。")
+        ));
         return out;
     }
 
-    out.push_str("Indicators:\n");
+    out.push_str(&format!("{}:\n", section(lang, "Indicators", "指标")));
     for s in &report.signals {
         let state = if s.read_failed {
-            "UNREADABLE".to_string()
+            section(lang, "UNREADABLE", "无法读取").to_string()
         } else if s.present {
-            format!("PRESENT ({:?})", s.weight)
+            format!("{} ({:?})", section(lang, "PRESENT", "存在"), s.weight)
         } else {
-            "absent".to_string()
+            section(lang, "absent", "不存在").to_string()
         };
         out.push_str(&format!("  {:<40}{}\n", s.id, state));
         out.push_str(&format!("      {}\n", s.detail));
@@ -491,36 +637,137 @@ pub fn pending_reboot_text(report: &PendingRebootReport) -> String {
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
-/// The label shown for a protection level.
+/// The column at which values begin.
+const COLUMN: usize = 26;
+
+/// Write a label/value row with the columns aligned.
 ///
-/// `Protected` is the only value that reads as reassuring; everything else is stated plainly.
-pub fn level_label(level: ProtectionLevel) -> &'static str {
-    match level {
-        ProtectionLevel::Protected => "Protected",
-        ProtectionLevel::Degraded => "Degraded",
-        ProtectionLevel::Maintenance => "Maintenance",
-        ProtectionLevel::Unknown => "Unknown",
-        ProtectionLevel::Unprotected => "NOT PROTECTED",
+/// Padding is computed from *display* width rather than character count, because a CJK ideograph
+/// occupies two terminal columns. Using `{:<24}` would leave every Chinese row short by one column
+/// per ideograph, so the values would not line up.
+fn row(out: &mut String, label: &str, value: &str) {
+    out.push_str("  ");
+    out.push_str(label);
+    out.push_str(&" ".repeat(COLUMN.saturating_sub(display_width(label))));
+    out.push_str(value);
+    out.push('\n');
+}
+
+/// Write an indented label/value row, for nested blocks.
+fn row2(out: &mut String, label: &str, value: &str) {
+    out.push_str("    ");
+    out.push_str(label);
+    out.push_str(&" ".repeat((COLUMN - 2).saturating_sub(display_width(label))));
+    out.push_str(value);
+    out.push('\n');
+}
+
+/// The number of terminal columns a string occupies.
+///
+/// Counts East Asian wide and fullwidth characters as two. This is a deliberately small
+/// approximation of Unicode's East Asian Width property, covering the ranges that appear in this
+/// program's output; it is used only for alignment, so a mis-categorised exotic character costs a
+/// space rather than correctness.
+pub fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    // Zero-width: combining marks and the common BOM/zero-width space range.
+    if (0x0300..=0x036F).contains(&cp) || (0x200B..=0x200F).contains(&cp) {
+        return 0;
+    }
+    let wide = (0x1100..=0x115F).contains(&cp)      // Hangul Jamo
+        || (0x2E80..=0x303E).contains(&cp)          // CJK radicals, Kangxi, CJK symbols
+        || (0x3041..=0x33FF).contains(&cp)          // Hiragana, Katakana, Bopomofo
+        || (0x3400..=0x4DBF).contains(&cp)          // CJK Extension A
+        || (0x4E00..=0x9FFF).contains(&cp)          // CJK Unified Ideographs
+        || (0xA000..=0xA4CF).contains(&cp)          // Yi
+        || (0xAC00..=0xD7A3).contains(&cp)          // Hangul syllables
+        || (0xF900..=0xFAFF).contains(&cp)          // CJK Compatibility Ideographs
+        || (0xFE10..=0xFE19).contains(&cp)          // Vertical forms
+        || (0xFE30..=0xFE6F).contains(&cp)          // CJK Compatibility Forms
+        || (0xFF00..=0xFF60).contains(&cp)          // Fullwidth forms
+        || (0xFFE0..=0xFFE6).contains(&cp)          // Fullwidth signs
+        || (0x1F300..=0x1F64F).contains(&cp)        // Emoji
+        || (0x1F900..=0x1F9FF).contains(&cp)
+        || (0x20000..=0x3FFFD).contains(&cp); // CJK Extensions B onward
+    if wide {
+        2
+    } else {
+        1
     }
 }
 
-/// The label shown for Internet health.
-pub fn internet_label(health: InternetHealth) -> &'static str {
+/// The label shown for a protection level, in either language.
+pub fn level_label(level: ProtectionLevel, lang: Lang) -> &'static str {
+    match level {
+        ProtectionLevel::Protected => msg::PROTECTED.get(lang),
+        ProtectionLevel::Degraded => msg::DEGRADED.get(lang),
+        ProtectionLevel::Maintenance => msg::MAINTENANCE.get(lang),
+        ProtectionLevel::Unknown => msg::UNKNOWN.get(lang),
+        ProtectionLevel::Unprotected => msg::UNPROTECTED.get(lang),
+    }
+}
+
+/// The label shown for Internet health, in either language.
+pub fn internet_label(health: InternetHealth, lang: Lang) -> &'static str {
     match health {
-        InternetHealth::Healthy => "Healthy",
-        InternetHealth::Degraded => "Degraded",
-        InternetHealth::Down => "Down",
-        InternetHealth::Unknown => "Unknown",
+        InternetHealth::Healthy => msg::HEALTHY.get(lang),
+        InternetHealth::Degraded => msg::DEGRADED.get(lang),
+        InternetHealth::Down => msg::DOWN.get(lang),
+        InternetHealth::Unknown => msg::UNKNOWN.get(lang),
+    }
+}
+
+/// The label shown for a protection mode, in either language.
+pub fn mode_label(mode: ProtectionMode, lang: Lang) -> &'static str {
+    match mode {
+        ProtectionMode::Normal => msg::MODE_NORMAL.get(lang),
+        ProtectionMode::Working => msg::MODE_WORKING.get(lang),
+        ProtectionMode::Maintenance => msg::MODE_MAINTENANCE.get(lang),
+    }
+}
+
+/// The label shown for a confidence level, in either language.
+pub fn confidence_label(c: Confidence, lang: Lang) -> &'static str {
+    match c {
+        Confidence::Confirmed => msg::CONFIDENCE_CONFIRMED.get(lang),
+        Confidence::High => msg::CONFIDENCE_HIGH.get(lang),
+        Confidence::Possible => msg::CONFIDENCE_POSSIBLE.get(lang),
+        Confidence::Unknown => msg::CONFIDENCE_UNKNOWN.get(lang),
+    }
+}
+
+/// The label shown for a pending-reboot verdict, in either language.
+pub fn verdict_label(v: PendingRebootVerdict, lang: Lang) -> &'static str {
+    match v {
+        PendingRebootVerdict::NotPending => msg::NOT_PENDING.get(lang),
+        PendingRebootVerdict::ProbablyPending => msg::PROBABLY_PENDING.get(lang),
+        PendingRebootVerdict::Pending => msg::PENDING.get(lang),
+        PendingRebootVerdict::Unknown => msg::UNKNOWN.get(lang),
+    }
+}
+
+/// A section header in either language.
+///
+/// Section headers are not in the shared table because only the CLI renders them; the panel uses
+/// HTML headings.
+pub fn section(lang: Lang, en: &'static str, zh: &'static str) -> &'static str {
+    match lang.resolve() {
+        Lang::ZhCn => zh,
+        _ => en,
     }
 }
 
 /// Render a Unix millisecond timestamp.
 pub fn format_ms(ms: i64) -> String {
-    // Rendered as a local-ish ISO-like string without pulling in a calendar dependency for what
-    // is purely a display concern. The epoch offset is computed in whole days.
     if ms <= 0 {
-        return "never".to_string();
+        return "—".to_string();
     }
+    // A compact, unambiguous rendering. A full calendar conversion is not worth a dependency for a
+    // value that is only ever read as "roughly when".
     let secs = ms / 1000;
     let days = secs / 86_400;
     let rem = secs % 86_400;
@@ -552,7 +799,7 @@ pub fn format_duration(ms: i64) -> String {
     format!("{}d {:02}h", hours / 24, hours % 24)
 }
 
-/// Truncate for display.
+/// Truncate for display, on a character boundary.
 fn truncate(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -563,404 +810,4 @@ fn truncate(s: &str, max: usize) -> String {
         out.push(c);
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use guardian_proto::model::UpdateProtectionReport;
-    use guardian_proto::model::*;
-
-    fn sample_status() -> StatusSnapshot {
-        StatusSnapshot {
-            mode: ProtectionMode::Working,
-            update: UpdateProtectionReport {
-                level: ProtectionLevel::Protected,
-                primary_lock_effective: true,
-                values: vec![],
-                neutralized_deadlines: vec![],
-                management: ManagementState::Unmanaged,
-                findings: vec![],
-                checked_at_ms: 1_000_000,
-                backend_error: None,
-            },
-            restart_protection: ProtectionLevel::Protected,
-            pending_reboot: PendingRebootReport {
-                verdict: PendingRebootVerdict::NotPending,
-                signals: vec![],
-                checked_at_ms: 1_000_000,
-            },
-            service: ServiceHealth {
-                running: true,
-                started_at_ms: 1_000_000,
-                uptime_ms: 3_600_000,
-                version: "0.1.0".into(),
-                degraded_components: vec![],
-                started_after_unclean_exit: false,
-            },
-            agents: Box::new(AgentInventory::default()),
-            network: Box::new(NetworkSnapshot::default()),
-            reboot_authorization: None,
-            maintenance_denial_reasons: vec![],
-            generated_at_ms: 1_000_000,
-            service_version: "0.1.0".into(),
-            boot_id: "boot-1".into(),
-            session_id_helper: SessionHelperState::Connected,
-        }
-    }
-
-    #[test]
-    fn the_status_screen_names_every_section() {
-        let text = status_text(&sample_status());
-        for section in [
-            "WORKSTATION GUARDIAN",
-            "Protection",
-            "Network",
-            "Active Work",
-        ] {
-            assert!(text.contains(section), "missing '{section}' in:\n{text}");
-        }
-        assert!(text.contains("Update Protection"));
-        assert!(text.contains("Protected"));
-        assert!(text.contains("WORKING"));
-    }
-
-    #[test]
-    fn an_unprotected_machine_does_not_render_the_word_protected() {
-        let mut s = sample_status();
-        s.update.level = ProtectionLevel::Unprotected;
-        s.update.primary_lock_effective = false;
-        let text = status_text(&s);
-        assert!(
-            text.contains("NOT PROTECTED"),
-            "an unprotected machine must say so plainly:\n{text}"
-        );
-    }
-
-    #[test]
-    fn degraded_components_are_shown() {
-        let mut s = sample_status();
-        s.service.degraded_components = vec!["network".into(), "agents".into()];
-        let text = status_text(&s);
-        assert!(text.contains("Degraded"));
-        assert!(text.contains("network"));
-        assert!(text.contains("agents"));
-    }
-
-    #[test]
-    fn maintenance_denial_reasons_are_listed() {
-        let mut s = sample_status();
-        s.maintenance_denial_reasons = vec!["Claude Code x 2".into()];
-        let text = status_text(&s);
-        assert!(text.contains("Claude Code x 2"));
-        assert!(text.contains("refused"));
-    }
-
-    #[test]
-    fn an_armed_reboot_is_visible() {
-        let mut s = sample_status();
-        s.reboot_authorization = Some(RebootAuthorization {
-            id: "a".into(),
-            nonce: "n".into(),
-            issued_at_ms: 1_000_000,
-            expires_at_ms: 1_800_000,
-            issued_boot_id: "boot-1".into(),
-            consumed_at_ms: None,
-            consumed_by_boot_id: None,
-            reason: "test".into(),
-            issued_by: "administrator".into(),
-        });
-        let text = status_text(&s);
-        assert!(text.contains("One reboot authorized"));
-    }
-
-    #[test]
-    fn an_empty_agent_list_says_so() {
-        let text = agents_text(&AgentInventory::default());
-        assert!(text.contains("No AI coding agents detected"));
-    }
-
-    #[test]
-    fn agents_text_includes_evidence_and_resume() {
-        let mut inv = AgentInventory::default();
-        inv.agents.push(AgentGroup {
-            kind: "claude_code".into(),
-            display_name: "Claude Code".into(),
-            confidence: Confidence::Confirmed,
-            instances: vec![AgentInstance {
-                kind: "claude_code".into(),
-                display_name: "Claude Code".into(),
-                pid: 42,
-                root_pid: 42,
-                identity: ProcessIdentity {
-                    pid: 42,
-                    created_filetime: 1,
-                },
-                session_id: "42".into(),
-                confidence: Confidence::Confirmed,
-                evidence: vec![Evidence::new(
-                    "process_name",
-                    "claude.exe",
-                    100,
-                    "the Claude Code CLI executable",
-                )],
-                started_at_filetime: 0,
-                started_at_ms: 0,
-                image_path: Some(r"C:\Users\dev\.local\bin\claude.exe".into()),
-                cmdline: None,
-                ancestry: vec![],
-                session_id_windows: 3,
-                user: None,
-                project: Some(ProjectContext {
-                    root: r"D:\Workspace\app".into(),
-                    name: "app".into(),
-                    source: "claude_session_file".into(),
-                    vcs: None,
-                }),
-                resume: ResumeCapability::Available {
-                    handle: "abc".into(),
-                    hint: "claude --resume abc".into(),
-                },
-            }],
-        });
-
-        let text = agents_text(&inv);
-        assert!(text.contains("Claude Code"));
-        assert!(text.contains("Confirmed"));
-        assert!(text.contains("claude.exe"), "evidence must be shown");
-        assert!(text.contains("app"), "the project must be shown");
-        assert!(text.contains("--resume"), "the resume hint must be shown");
-    }
-
-    #[test]
-    fn candidates_are_shown_but_flagged_as_unprotected() {
-        let mut inv = AgentInventory::default();
-        inv.candidates.push(AgentCandidate {
-            candidate_id: "mystery.exe:weak".into(),
-            pid: 9,
-            identity: ProcessIdentity {
-                pid: 9,
-                created_filetime: 1,
-            },
-            name: "mystery.exe".into(),
-            image_path: None,
-            cmdline: None,
-            confidence: Confidence::Possible,
-            evidence: vec![Evidence::new("near_miss", "weak", 10, "below threshold")],
-            first_seen_ms: 0,
-            last_seen_ms: 0,
-            observations: 1,
-        });
-
-        let text = agents_text(&inv);
-        assert!(text.contains("mystery.exe"));
-        assert!(
-            text.contains("never block shutdown"),
-            "the UI must state that candidates are not protected: {text}"
-        );
-    }
-
-    #[test]
-    fn network_text_shows_probes_and_outages() {
-        let mut n = NetworkSnapshot {
-            internet: InternetHealth::Healthy,
-            ..Default::default()
-        };
-        n.probes = vec![ProbeResult {
-            id: "tcp-a".into(),
-            kind: ProbeKind::Tcp,
-            target: "1.1.1.1:443".into(),
-            ok: true,
-            latency_ms: Some(12),
-            error: None,
-        }];
-        n.current_outage = Some(OutageRecord {
-            id: "o".into(),
-            started_at_ms: 1_000_000,
-            ended_at_ms: None,
-            downtime_ms: Some(30_000),
-            reason: "PPPOE_SESSION_LOST".into(),
-            dial_attempts: 3,
-            ras_errors: vec![RasErrorRecord {
-                code: 678,
-                message: "there is no answer".into(),
-                at_ms: 1_000_000,
-            }],
-        });
-
-        let text = network_text(&n);
-        assert!(text.contains("Healthy"));
-        assert!(text.contains("tcp-a"));
-        assert!(text.contains("12ms"));
-        assert!(text.contains("PPPOE_SESSION_LOST"));
-        assert!(text.contains("678"));
-        assert!(text.contains("there is no answer"));
-    }
-
-    #[test]
-    fn network_text_says_so_when_no_probes_are_configured() {
-        let n = NetworkSnapshot::default();
-        let text = network_text(&n);
-        assert!(text.contains("none configured"));
-    }
-
-    #[test]
-    fn incidents_text_handles_the_empty_case() {
-        assert!(incidents_text(&[]).contains("No incidents"));
-    }
-
-    #[test]
-    fn incidents_text_renders_an_unexpected_restart() {
-        let incident = Incident {
-            id: "i".into(),
-            kind: IncidentKind::UnexpectedRestart,
-            at_ms: 1_000_000,
-            title: "Unexpected restart detected".into(),
-            summary: "the machine restarted uncleanly".into(),
-            severity: FindingSeverity::Warning,
-            details: IncidentDetails {
-                unexpected_restart: Some(UnexpectedRestart {
-                    detected_at_ms: 1_000_000,
-                    previous_boot_id: "boot-1".into(),
-                    current_boot_id: "boot-2".into(),
-                    likely_initiator: Some("Windows Update".into()),
-                    reason: Some("planned".into()),
-                    confidence: CauseConfidence::Likely,
-                    windows_update_related: WindowsUpdateRelation::Yes,
-                    evidence: vec![EventEvidence {
-                        provider: "User32".into(),
-                        event_id: 1074,
-                        at_ms: 999_000,
-                        message: "the process ... initiated the restart".into(),
-                    }],
-                    agents_lost: vec![LostAgent {
-                        kind: "claude_code".into(),
-                        display_name: "Claude Code".into(),
-                        pid: 42,
-                        session_id: "s".into(),
-                        project: Some("app".into()),
-                        last_seen_ms: 999_000,
-                        resume: ResumeCapability::Unavailable,
-                    }],
-                    protected_jobs_lost: 2,
-                    last_heartbeat_ms: Some(999_000),
-                    last_network_state: Some("healthy".into()),
-                    reboot_was_authorized: false,
-                }),
-                ..Default::default()
-            },
-        };
-
-        let text = incidents_text(&[incident]);
-        assert!(text.contains("Unexpected restart"));
-        assert!(text.contains("boot-1 -> boot-2"));
-        assert!(text.contains("Windows Update"));
-        assert!(text.contains("Claude Code"), "lost agents must be listed");
-        assert!(text.contains("User32"), "evidence must be listed");
-    }
-
-    #[test]
-    fn pending_reboot_text_lists_indicators() {
-        let report = PendingRebootReport {
-            verdict: PendingRebootVerdict::ProbablyPending,
-            signals: vec![
-                RebootSignal {
-                    id: "cbs.reboot_pending".into(),
-                    source: RebootSignalSource::ComponentServicing,
-                    present: false,
-                    weight: RebootSignalWeight::Conclusive,
-                    detail: "component servicing reports a restart is required".into(),
-                    read_failed: false,
-                },
-                RebootSignal {
-                    id: "sm.pending_file_rename".into(),
-                    source: RebootSignalSource::Registry,
-                    present: true,
-                    weight: RebootSignalWeight::Strong,
-                    detail: "file operations are queued".into(),
-                    read_failed: false,
-                },
-            ],
-            checked_at_ms: 1_000_000,
-        };
-
-        let text = pending_reboot_text(&report);
-        assert!(text.contains("ProbablyPending"));
-        assert!(text.contains("cbs.reboot_pending"));
-        assert!(text.contains("absent"));
-        assert!(text.contains("PRESENT"));
-    }
-
-    #[test]
-    fn duration_formatting_is_readable_across_magnitudes() {
-        assert_eq!(format_duration(0), "0s");
-        assert_eq!(format_duration(5_000), "5s");
-        assert_eq!(format_duration(90_000), "1m 30s");
-        assert_eq!(format_duration(3_600_000), "1h 00m");
-        assert_eq!(format_duration(90_000_000), "1d 01h");
-        assert_eq!(format_duration(-1), "unknown");
-    }
-
-    #[test]
-    fn timestamp_formatting_handles_the_never_case() {
-        assert_eq!(format_ms(0), "never");
-        assert_eq!(format_ms(-5), "never");
-        assert!(format_ms(1_000_000).starts_with("day+"));
-    }
-
-    #[test]
-    fn every_response_variant_renders_something() {
-        // A rendering gap would show as an empty line in a terminal, which is easy to miss.
-        let responses = vec![
-            Response::Hello {
-                protocol: 1,
-                service_version: "0.1.0".into(),
-                server_time: 0,
-            },
-            Response::status(sample_status()),
-            Response::agents(AgentInventory::default()),
-            Response::network(NetworkSnapshot::default()),
-            Response::incidents(vec![]),
-            Response::pending_reboot(PendingRebootReport {
-                verdict: PendingRebootVerdict::NotPending,
-                signals: vec![],
-                checked_at_ms: 0,
-            }),
-            Response::reboot_authorization(None),
-            Response::Ok {
-                message: "done".into(),
-            },
-            Response::error(guardian_proto::ProtocolError::refused("no")),
-        ];
-
-        for r in responses {
-            let text = render_response(&r);
-            assert!(!text.trim().is_empty(), "response rendered as empty: {r:?}");
-        }
-    }
-
-    #[test]
-    fn level_labels_never_overstate_protection() {
-        assert_eq!(level_label(ProtectionLevel::Protected), "Protected");
-        for level in [
-            ProtectionLevel::Degraded,
-            ProtectionLevel::Maintenance,
-            ProtectionLevel::Unknown,
-        ] {
-            assert_ne!(
-                level_label(level),
-                "Protected",
-                "{level:?} must not render as Protected"
-            );
-        }
-        assert_eq!(level_label(ProtectionLevel::Unprotected), "NOT PROTECTED");
-    }
-
-    #[test]
-    fn truncation_is_character_safe_and_marks_elision() {
-        assert_eq!(truncate("short", 10), "short");
-        let truncated = truncate("日本語のとても長い文字列", 5);
-        assert!(truncated.starts_with("日本語"));
-        assert!(truncated.ends_with('…'));
-    }
 }

@@ -1322,6 +1322,8 @@ dependencies = [
  "guardian-core",
  "guardian-proto",
  "guardian-service",
+ "guardian-storage",
+ "guardian-win",
  "serde",
  "serde_json",
  "tauri",

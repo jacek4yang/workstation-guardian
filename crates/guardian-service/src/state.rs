@@ -107,7 +107,7 @@ impl ServiceState {
         }
     }
 
-    /// The overall service health, for the UI banner.
+    /// The overall Guardian health, for the UI banner.
     pub fn service_health(&self, now_ms: i64) -> ServiceHealth {
         let degraded: Vec<String> = self
             .workers

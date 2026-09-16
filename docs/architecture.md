@@ -1,35 +1,47 @@
 # Architecture
 
-Workstation Guardian is a Windows service that owns protection, plus thin clients that observe
-and request. The split is deliberate: protection must not depend on anything with a UI, a user
-session, or a lifecycle shorter than the machine's.
+Workstation Guardian is a single elevated tray application that hosts the protection runtime in
+its own process. There is no Windows service, nothing registered with the Service Control
+Manager, and nothing left behind when it exits.
+
+The runtime is deliberately *not* part of the UI's lifecycle. It runs on its own thread with its
+own supervisor, so a crash in the webview, a hung panel, or an operator closing the window cannot
+stop protection. That property is what the process layout has to preserve:
 
 ```text
-guardian-service.exe        Windows Service, LocalSystem — the authority
+guardian-ui.exe             elevated, one process — the program
         │
-        │  named pipe, closed protocol, per-operation authorization
+        ├── runtime thread  ── update protection, agent detection, network guardian,
+        │   │                   recovery journal   (worker threads + supervisor)
+        │   │
+        │   └── named pipe, closed protocol, per-operation authorization
+        │            │
+        │            └── guardianctl.exe        diagnostics (any process, on demand)
         │
-        ├── guardian-ui.exe       tray + control panel (Tauri v2)
-        ├── guardian-session.exe  per-user shutdown blocker (tiny, native)
-        └── guardianctl.exe       diagnostics and installation
+        └── window thread   ── tray icon + control panel (Tauri v2 / WebView2)
+              reads the runtime's state in-process; does not depend on the pipe
 ```
+
+`guardian-session.exe` runs separately in each interactive session. It must: a shutdown block is
+per-session by nature, and a process in the runtime's elevated context cannot hold one for a user's
+logon session.
 
 ## Crates
 
 ```text
 crates/
-  guardian-proto    versioned wire protocol and the shared data model
+  guardian-proto    versioned wire protocol, shared data model, bilingual text
   guardian-core     pure state machines; no I/O, no Win32, no globals
   guardian-storage  atomic documents and a checksummed append-only journal
   guardian-win      the only crate containing unsafe; safe Win32 wrappers
   guardian-process  process graph, agent detection engine, signature database
   guardian-network  connectivity probes, RAS/Wi-Fi backend, the network worker
   guardian-update   Windows Update verification loop and tamper detection
-  guardian-service  supervisor, state coordinator, IPC server, journal, logging
+  guardian-service  the runtime: supervisor, state coordinator, IPC server, journal, logging
 apps/
-  guardian-session  shutdown blocker
-  guardian-ui       Tauri tray and control panel
-  guardianctl       diagnostics and installation
+  guardian-ui       Tauri tray + control panel, and the host of the runtime
+  guardian-session  per-user shutdown blocker
+  guardianctl       diagnostics
 ```
 
 ### The dependency direction
@@ -45,6 +57,16 @@ apps/
 `guardian-core` never depends on `guardian-win`. That is what makes the safety-critical logic
 testable without a computer that can be rebooted, and it is enforced by the crate graph rather
 than by convention.
+
+### Why the runtime lives in a library, not in a binary
+
+`guardian-service` exposes `runtime::run()`, which starts the workers and blocks until asked to
+stop. Both hosts use it: the tray application for normal use, and the `guardian-service` console
+binary for development and for observing the runtime without a GUI.
+
+Keeping the runtime out of a `main()` is what makes the no-service design affordable. Hosting is a
+thin concern — a Tauri builder, or a few lines of argument parsing — while the protection logic is
+unchanged and still testable on its own.
 
 ## Why the state machines are pure
 
@@ -71,33 +93,39 @@ consequences are concrete:
 `guardian-core` is `#![forbid(unsafe_code)]`. `guardian-win` is the only crate with `unsafe`, and
 it is `#![deny(unsafe_op_in_unsafe_fn)]` with every unsafe operation individually justified.
 
-## Service lifecycle
+## Runtime lifecycle
 
 ### Startup
 
 1. Load configuration. Corruption falls back to defaults, which **protect updates**, so a bad
-   config cannot leave the machine unprotected.
+   config cannot leave the machine unprotected. On first run this also writes a default
+   configuration and creates the data directory, so the operator has a real file to edit.
 2. Open the journal and determine whether the previous session ended cleanly — *before* anything
    writes to the journal, so the evidence is not overwritten.
 3. **Apply update protection synchronously**, before any worker starts. A machine that is booting
    is exactly when an unexpected update restart is least welcome, so protection must not wait on
    the supervisor.
 4. Start the supervised workers.
-5. Serve IPC.
+5. Serve IPC, and hand the state handle to the host so the panel can read it in-process.
 
 ### Shutdown
 
-The SCM control handler only sets flags; the main thread polls them. That is what lets a stop be
-acknowledged promptly even while a worker is mid-task.
-
-`SERVICE_ACCEPT_PRESHUTDOWN` is requested so Windows gives the service an early chance to flush
-state. Preshutdown is treated as a *warning*, not a stop: the service keeps protecting until the
-actual stop arrives, because ending protection several seconds early is exactly the window an
-update could use.
+Shutdown is requested from the tray menu or the panel, or by the console harness ending. Either
+way it sets a flag that the runtime's control loop polls. That is what lets a stop be acknowledged
+promptly even while a worker is mid-task, and what keeps the wait bounded: the host waits
+`SHUTDOWN_GRACE` and then exits regardless, so an explicit exit is never hostage to a wedged
+worker.
 
 On stop, the journal is flushed and the clean-shutdown marker written with a synchronous
-`FlushFileBuffers`. That marker is the only thing that makes the next boot treat this one as
+`FlushFileBuffers`. That marker is the only thing that makes the next start treat this one as
 clean.
+
+There is no `SERVICE_ACCEPT_PRESHUTDOWN` any more, and that is a real trade. A service could ask
+Windows for an early warning before a shutdown; an ordinary process cannot. Guardian handles this
+two ways instead: the journal is checkpointed on a timer (every 15 s in `WORKING`, every 60 s in
+`NORMAL`), and `guardian-session.exe` holds the shutdown off in the interactive session. The
+worst case is therefore losing up to one checkpoint interval of metadata — never the work itself,
+which Guardian does not own.
 
 ### Worker supervision
 
@@ -111,8 +139,13 @@ Each subsystem runs as its own supervised task:
   so the status surface never claims everything is fine;
 * the supervisor itself never panics on a worker failure.
 
-Panics are not globally swallowed. A panic is a bug; the supervisor's job is to keep the *service*
+Panics are not globally swallowed. A panic is a bug; the supervisor's job is to keep the *runtime*
 alive and make the bug loud.
+
+Supervision matters more in this design than it did with a service, not less. There is no SCM to
+notice that Guardian died and restart it, so the supervisor is the only thing standing between a
+bug in one worker and an unprotected machine. That is also why the panel does not share a thread
+with the runtime.
 
 ## State and mode
 
@@ -187,7 +220,11 @@ Two design points worth stating here:
 * **The server keeps a spare listening instance armed** before serving the current one, and never
   disconnects a connection that has just arrived. A named pipe only accepts a connection while an
   instance is listening, so without this a second client arriving mid-serve is closed with "no
-  process on the other end" — indistinguishable from the service having died.
+  process on the other end" — indistinguishable from Guardian having died.
+
+The tray panel does not use this pipe. It reads the shared state directly, which means a panel
+that is open, closed, hung, or crashed has no effect on whether `guardianctl` can diagnose the
+machine.
 
 ## Idle cost
 
@@ -198,5 +235,6 @@ Guardian is designed to run for months.
   verification pass.
 * No constant WMI full snapshots; the process inventory uses a toolhelp snapshot.
 * No fsync without a changed state.
-* The UI polls at 5 seconds and does nothing when its window is closed.
+* The panel is pushed to every 3 seconds while it is open, and does nothing at all while it is
+  hidden. There is no polling timer in the frontend.
 * Logs are bounded on disk; journals rotate.

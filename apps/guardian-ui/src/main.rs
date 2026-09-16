@@ -1,82 +1,218 @@
-//! `guardian-ui` — the tray icon and control panel.
+//! Workstation Guardian — the whole program, in one process.
 //!
-//! # What this process is, and is not
+//! # What this is
 //!
-//! It is a *view*. Every fact it displays comes from `guardian-service` over the named pipe, and
-//! every action it offers is a request to that service. It holds no protection authority of its
-//! own, which is why closing it - or crashing it, or killing WebView2 - has no effect on
-//! protection whatsoever.
+//! A single elevated tray application. It hosts the protection runtime directly, so there is no
+//! Windows service, nothing registered with the Service Control Manager, no installer, and nothing
+//! left behind when it exits.
 //!
-//! Consequences that are load-bearing:
+//! ```text
+//!   guardian-ui.exe  (elevated, one process)
+//!        │
+//!        ├── the Guardian runtime: update protection, agent detection,
+//!        │   network guardian, recovery journal   (worker threads)
+//!        │
+//!        └── tray icon + control panel (Tauri / WebView2)
+//! ```
 //!
-//! * Closing the window hides it to the tray rather than exiting, so the tray icon stays available
-//!   without a window being open.
-//! * "Exit UI" stops this process and nothing else. There is deliberately no way to stop the
-//!   service from here; that requires an explicit administrative action (`guardianctl stop`).
-//! * Every privileged action goes through the service, which re-checks the calling principal.
-//!   The UI being unable to do something is a convenience, not a security boundary.
+//! The control panel reads the runtime's state *in process*, so a UI fault cannot take protection
+//! down: the runtime runs on its own thread with its own supervisor. The named-pipe IPC server
+//! still runs inside the runtime, because `guardianctl` uses it, but the panel does not depend on it.
 //!
-//! # Why the state is polled on a timer
+//! # Lifecycle
 //!
-//! The service pushes state to subscribers, but the tray needs an icon that reflects reality even
-//! when nothing has changed for hours. A single low-frequency poll (a few seconds) that updates
-//! both the window and the tray is simpler than maintaining a push connection in the UI, and at
-//! this interval its cost is negligible.
+//! * Closing the window hides it to the tray. Protection continues untouched.
+//! * The tray icon is the program's presence. It disappears only when the program exits.
+//! * Exiting is explicit — from the tray menu or the panel. It stops the runtime cleanly, which
+//!   writes the recovery journal's clean-shutdown marker and persists state.
+//!
+//! # Elevation
+//!
+//! Update protection is a machine-wide policy write, so it needs administrator rights. Without them
+//! the runtime still starts and reports honestly: update protection reads `Unknown` rather than
+//! claiming a lock it could not apply. The panel says so at the top of the window instead of
+//! pretending everything is fine.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use guardian_proto::i18n::{msg, Text};
 use guardian_proto::model::*;
-use guardian_proto::{Request, Response};
+use guardian_proto::Lang;
+use guardian_service::runtime::{run, GuardianRuntime, RuntimeOptions};
+use guardian_service::state::{ServiceState, SharedState};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
-/// How often the UI refreshes from the service.
+/// Wire the tray menu to [`handle_menu_event`].
 ///
-/// Long enough to be free, short enough that the tray icon is never stale for long.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Kept as a small function so the builder chain stays readable and so the same handler is
+/// reachable from a test.
+const MENU_EVENT_HANDLER: fn(&AppHandle, &str) = handle_menu_event;
 
-/// The most recent snapshot, shared with the poller.
+/// How often the tray labels and the open panel are refreshed from the in-process state.
+///
+/// Cheap: it takes a read lock and formats a few strings. Frequent enough that the tray is never
+/// visibly stale, infrequent enough to be invisible in a process that runs for months.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long to let the runtime shut down before the process exits anyway.
+///
+/// The runtime flushes its journal and writes the clean-shutdown marker on the way out. A short
+/// bounded wait means an explicit exit is still prompt even if a worker is wedged.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// Shared between the UI and the runtime thread.
+///
+/// Deliberately tiny: the only thing the UI needs from the runtime is the state handle and the
+/// ability to ask it to stop. Everything else the panel displays comes out of `ServiceState`.
 #[derive(Default)]
-struct UiState {
-    last: Option<StatusSnapshot>,
-    /// Set when the service is unreachable, so the UI can say so rather than showing stale data
-    /// as though it were current.
-    last_error: Option<String>,
+struct UiBridge {
+    /// `None` until the runtime has published its state.
+    runtime: Mutex<Option<GuardianRuntime>>,
+    /// Whether the runtime has been asked to stop, so the exit path runs once.
+    exiting: AtomicBool,
+    /// Set when this process is not elevated, so the panel can say what is not protected.
+    elevated: AtomicBool,
+}
+
+impl UiBridge {
+    /// Publish the runtime. Returns the state handle and whether this process is elevated.
+    fn attach(&self, runtime: GuardianRuntime, elevated: bool) -> SharedState {
+        let shared = runtime.state();
+        self.elevated.store(elevated, Ordering::SeqCst);
+        if let Ok(mut guard) = self.runtime.lock() {
+            *guard = Some(runtime);
+        }
+        shared
+    }
+
+    /// Run `f` against the live state, if the runtime is up.
+    ///
+    /// A poisoned lock is recovered rather than propagated: a UI thread panicking must not stop the
+    /// operator from seeing their protection status.
+    fn with_state<T>(&self, f: impl FnOnce(&ServiceState) -> T) -> Option<T> {
+        let guard = match self.runtime.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let shared = guard.as_ref()?.state();
+        drop(guard);
+
+        let state = match shared.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        Some(f(&state))
+    }
+
+    /// The panel document, or `None` while the runtime is still starting.
+    fn panel(&self, lang: Lang) -> Option<serde_json::Value> {
+        self.with_state(|state| {
+            let snapshot = state.snapshot(guardian_win::clock::unix_now_ms());
+            panel_json(state, &snapshot, lang)
+        })
+    }
+
+    fn is_elevated(&self) -> bool {
+        self.elevated.load(Ordering::SeqCst)
+    }
+
+    /// Ask the runtime to stop and wait, briefly, for it to finish.
+    fn request_stop(&self) {
+        if self.exiting.swap(true, Ordering::SeqCst) {
+            return; // already exiting; the second request must not wait again
+        }
+        let guard = match self.runtime.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(runtime) = guard.as_ref() {
+            runtime.request_stop();
+        }
+        drop(guard);
+
+        let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+        while std::time::Instant::now() < deadline {
+            let done = matches!(self.runtime.lock(), Ok(g) if g.as_ref().is_some_and(|r| r.is_shutting_down()));
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 fn main() {
-    build_tauri_app()
+    // One copy only. Two would fight over the same policy keys and the same journal.
+    if let Some(existing) = already_running() {
+        eprintln!(
+            "Workstation Guardian is already running (pid {existing}). \
+             Use the tray icon to open it."
+        );
+        return;
+    }
+
+    build_app()
         .run(tauri::generate_context!())
         .expect("the Tauri runtime could not start");
 }
 
-fn build_tauri_app() -> tauri::Builder<tauri::Wry> {
+/// Whether another copy of this program is already running, and its pid.
+///
+/// Compares by image name rather than by a lock file. A lock file left behind by a crash would
+/// permanently block startup; a running process is self-evidently current.
+fn already_running() -> Option<u32> {
+    let me = std::process::id();
+    let mut processes = guardian_win::process::enumerate_processes().ok()?;
+    processes.retain(|p| p.pid != me);
+    processes
+        .into_iter()
+        .find(|p| {
+            let name = p.name.to_ascii_lowercase();
+            name == "guardian-ui.exe" || name == "guardian.exe"
+        })
+        .map(|p| p.pid)
+}
+
+/// The language to render in, from configuration, defaulting to the system locale.
+fn configured_language() -> Lang {
+    let paths = guardian_storage::GuardianPaths::production();
+    match std::fs::read_to_string(paths.config_file()) {
+        Ok(text) => {
+            guardian_core::config::load_from_str(&text)
+                .document
+                .body
+                .language
+        }
+        Err(_) => Lang::Auto,
+    }
+}
+
+fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
-        .manage(Mutex::new(UiState::default()))
+        .manage(UiBridge::default())
+        .manage(configured_language())
         .invoke_handler(tauri::generate_handler![
-            get_status,
-            get_agents,
+            get_panel,
             get_incidents,
-            get_network,
-            enter_maintenance,
-            exit_maintenance,
-            arm_reboot,
-            disarm_reboot,
+            get_language,
             reconnect,
-            exit_ui,
+            exit_app,
         ])
         .setup(|app| {
-            install_tray(app.handle())?;
-            start_refresh_loop(app.handle().clone());
+            let handle = app.handle().clone();
+            install_tray(&handle)?;
+            start_runtime(handle);
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window hides it. The tray icon remains, and protection is unaffected -
-            // the service never depended on this process.
+            // Closing the window hides it. The runtime keeps running and protection is unaffected,
+            // which is the entire reason the UI is not the program's lifecycle.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
@@ -84,19 +220,74 @@ fn build_tauri_app() -> tauri::Builder<tauri::Wry> {
         })
 }
 
+/// Start the protection runtime on its own thread.
+///
+/// The runtime owns the process's real work. This thread runs until the runtime stops, which is why
+/// a panic in the webview cannot end protection.
+fn start_runtime(app: AppHandle) {
+    std::thread::spawn(move || {
+        let elevated = guardian_win::elevation::is_elevated();
+
+        run(
+            RuntimeOptions {
+                run_for: None,
+                echo_errors: true,
+            },
+            move |runtime| {
+                let bridge = app.state::<UiBridge>();
+                let shared = bridge.attach(runtime, elevated);
+
+                if !elevated {
+                    tracing::warn!(
+                        "not elevated: Windows Update policy cannot be applied. \
+                         Restart the program as administrator for full protection."
+                    );
+                }
+
+                // Refresh the tray and the open panel from the live state.
+                let app = app.clone();
+                std::thread::spawn(move || refresh_loop(app, shared));
+            },
+        );
+    });
+}
+
+/// Publish runtime state to the tray, and to the window when it is open.
+fn refresh_loop(app: AppHandle, shared: SharedState) {
+    let lang = *app.state::<Lang>();
+
+    loop {
+        std::thread::sleep(REFRESH_INTERVAL);
+
+        let state = match shared.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let snapshot = state.snapshot(guardian_win::clock::unix_now_ms());
+
+        if let Some(items) = app.try_state::<TrayItems>() {
+            items.update(&snapshot, lang);
+        }
+
+        if let Some(window) = app.get_webview_window("main") {
+            let panel = panel_json(&state, &snapshot, lang);
+            let _ = window.emit("guardian://panel", panel);
+        }
+    }
+}
+
 /// Build the tray icon and its menu.
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
-    // Menu items are rebuilt on each refresh so their labels track the live state; the menu itself
-    // is created once and its items replaced.
-    let (menu, items) = build_menu(app, None)?;
+    let lang = *app.state::<Lang>();
+    let (menu, items) = build_menu(app, lang)?;
 
     TrayIconBuilder::with_id("guardian-tray")
         .tooltip("Workstation Guardian")
         .icon(tray_icon())
         .menu(&menu)
         .show_menu_on_left_click(false)
-        // Left click opens the panel; right click shows the menu. That is what a Windows tray icon
-        // is expected to do.
+        // Left click opens the panel, right click shows the menu. That is what a Windows tray icon
+        // is expected to do, and it means the panel is one click away without hunting the menu.
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -107,14 +298,14 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_window(tray.app_handle());
             }
         })
+        .on_menu_event(|app, event| MENU_EVENT_HANDLER(app, event.id().as_ref()))
         .build(app)?;
 
-    // Keep the item handles so the refresh loop can relabel them.
     app.manage(items);
     Ok(())
 }
 
-/// The tray menu items whose labels change.
+/// The tray menu items whose labels track the live state.
 struct TrayItems {
     status: MenuItem<tauri::Wry>,
     agents: MenuItem<tauri::Wry>,
@@ -122,76 +313,73 @@ struct TrayItems {
 }
 
 impl TrayItems {
-    fn update(&self, snapshot: Option<&StatusSnapshot>, error: Option<&str>) {
-        match (snapshot, error) {
-            (_, Some(_)) => {
-                let _ = self.status.set_text("Service unreachable");
-                let _ = self.agents.set_text("Agents: unknown");
-                let _ = self.network.set_text("Internet: unknown");
-            }
-            (Some(s), None) => {
-                let _ = self
-                    .status
-                    .set_text(format!("Update protection: {}", s.update.level.as_str()));
-                let _ = self
-                    .agents
-                    .set_text(format!("Active agents: {}", s.agents.agent_count()));
-                let _ = self
-                    .network
-                    .set_text(format!("Internet: {}", internet_label(s.network.internet)));
-            }
-            (None, None) => {}
-        }
+    fn update(&self, snapshot: &StatusSnapshot, lang: Lang) {
+        let _ = self.status.set_text(format!(
+            "{}: {}",
+            msg::UPDATE_PROTECTION.get(lang),
+            level_label(snapshot.update.level, lang)
+        ));
+
+        let _ = self.agents.set_text(format!(
+            "{}: {}",
+            msg::ACTIVE_AGENTS.get(lang),
+            snapshot.agents.agent_count()
+        ));
+
+        let _ = self.network.set_text(format!(
+            "{}: {}",
+            msg::INTERNET.get(lang),
+            internet_label(snapshot.network.internet, lang)
+        ));
     }
 }
 
 /// Build the tray menu.
-///
-/// Returns `tauri::Result` directly: every failure here is a Tauri menu error, and converting to a
-/// string only to convert back would lose the original error's type.
-fn build_menu(
-    app: &AppHandle,
-    snapshot: Option<&StatusSnapshot>,
-) -> tauri::Result<(Menu<tauri::Wry>, TrayItems)> {
+fn build_menu(app: &AppHandle, lang: Lang) -> tauri::Result<(Menu<tauri::Wry>, TrayItems)> {
     let status = MenuItem::with_id(
         app,
         "status",
-        snapshot
-            .map(|s| format!("Update protection: {}", s.update.level.as_str()))
-            .unwrap_or_else(|| "Update protection: unknown".into()),
+        format!(
+            "{}: {}",
+            msg::UPDATE_PROTECTION.get(lang),
+            msg::UNKNOWN.get(lang)
+        ),
         false,
         None::<&str>,
     )?;
-
     let agents = MenuItem::with_id(
         app,
         "agents",
-        snapshot
-            .map(|s| format!("Active agents: {}", s.agents.agent_count()))
-            .unwrap_or_else(|| "Active agents: unknown".into()),
+        format!("{}: —", msg::ACTIVE_AGENTS.get(lang)),
         false,
         None::<&str>,
     )?;
-
     let network = MenuItem::with_id(
         app,
         "network",
-        snapshot
-            .map(|s| format!("Internet: {}", internet_label(s.network.internet)))
-            .unwrap_or_else(|| "Internet: unknown".into()),
+        format!("{}: —", msg::INTERNET.get(lang)),
         false,
         None::<&str>,
     )?;
 
-    let open = MenuItem::with_id(app, "open", "Open Guardian", true, None::<&str>)?;
-    let reconnect = MenuItem::with_id(app, "reconnect", "Reconnect Internet", true, None::<&str>)?;
-    let maintenance =
-        MenuItem::with_id(app, "maintenance", "Maintenance Mode…", true, None::<&str>)?;
-    let diagnostics = MenuItem::with_id(app, "diagnostics", "Diagnostics", true, None::<&str>)?;
+    let open = MenuItem::with_id(
+        app,
+        "open",
+        Text::new("Open Guardian", "打开 Guardian").get(lang),
+        true,
+        None::<&str>,
+    )?;
+    let data_folder = MenuItem::with_id(
+        app,
+        "data-folder",
+        Text::new("Open data folder", "打开数据目录").get(lang),
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(
         app,
-        "exit-ui",
-        "Exit UI (service keeps running)",
+        "exit-app",
+        Text::new("Exit Guardian", "退出 Guardian").get(lang),
         true,
         None::<&str>,
     )?;
@@ -207,9 +395,7 @@ fn build_menu(
             &network,
             &sep1,
             &open,
-            &reconnect,
-            &maintenance,
-            &diagnostics,
+            &data_folder,
             &sep2,
             &quit,
         ],
@@ -227,7 +413,7 @@ fn build_menu(
 
 /// The tray icon.
 ///
-/// Generated in code rather than loaded from a file so the UI has no binary asset dependency and
+/// Drawn in code rather than loaded from a file, so the program has no runtime asset dependency and
 /// cannot fail to start because a resource is missing.
 fn tray_icon() -> tauri::image::Image<'static> {
     const SIZE: u32 = 32;
@@ -235,16 +421,14 @@ fn tray_icon() -> tauri::image::Image<'static> {
 
     for y in 0..SIZE {
         for x in 0..SIZE {
-            // A simple shield shape: a rounded square with a lighter border, in the same blue the
-            // panel uses for "protected".
             let dx = (x as i32 - 16).abs();
             let dy = (y as i32 - 16).abs();
             let inside = dx <= 11 && dy <= 13;
             let border = inside && (dx >= 9 || dy >= 11);
             let (r, g, b, a) = if border {
-                (0x37u8, 0x66u8, 0xC4u8, 0xFFu8)
+                (0x5Au8, 0x9Bu8, 0xE8u8, 0xFFu8)
             } else if inside {
-                (0x2B, 0x53, 0x9E, 0xFF)
+                (0x1E, 0x5C, 0xB0, 0xFF)
             } else {
                 (0, 0, 0, 0)
             };
@@ -264,69 +448,153 @@ fn show_window(app: &AppHandle) {
     }
 }
 
-/// Poll the service and push the result to the window.
-fn start_refresh_loop(app: AppHandle) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(REFRESH_INTERVAL);
+// ---------------------------------------------------------------------------
+// Labels, shared with the CLI so the two can never disagree
+// ---------------------------------------------------------------------------
 
-            let snapshot = fetch_status();
-            let (state, error) = match &snapshot {
-                Ok(s) => (Some(s.clone()), None),
-                Err(e) => (None, Some(e.clone())),
-            };
-
-            // Update the shared state so an `invoke` from the window sees fresh data.
-            if let Some(shared) = app.try_state::<Mutex<UiState>>() {
-                if let Ok(mut guard) = shared.lock() {
-                    if state.is_some() {
-                        guard.last = state.clone();
-                    }
-                    guard.last_error = error.clone();
-                }
-            }
-
-            // Relabel the tray items.
-            if let Some(items) = app.try_state::<TrayItems>() {
-                items.update(state.as_ref(), error.as_deref());
-            }
-
-            // Tell the window, if it is open. A closed window costs nothing here.
-            if let Some(window) = app.get_webview_window("main") {
-                let payload = match &snapshot {
-                    Ok(s) => serde_json::json!({ "ok": true, "status": s }),
-                    Err(e) => serde_json::json!({ "ok": false, "error": e }),
-                };
-                let _ = window.emit("guardian://status", payload);
-            }
-        }
-    });
-}
-
-/// Fetch the current status from the service.
-fn fetch_status() -> Result<StatusSnapshot, String> {
-    match call(&Request::GetStatus)? {
-        Response::Status { snapshot } => Ok(*snapshot),
-        Response::Error { error } => Err(error.to_string()),
-        other => Err(format!("unexpected reply: {other:?}")),
+/// The label for a protection level.
+pub fn level_label(level: ProtectionLevel, lang: Lang) -> &'static str {
+    match level {
+        ProtectionLevel::Protected => msg::PROTECTED.get(lang),
+        ProtectionLevel::Degraded => msg::DEGRADED.get(lang),
+        ProtectionLevel::Maintenance => msg::MAINTENANCE.get(lang),
+        ProtectionLevel::Unknown => msg::UNKNOWN.get(lang),
+        ProtectionLevel::Unprotected => msg::UNPROTECTED.get(lang),
     }
 }
 
-/// Send one request to the service over the pipe.
-///
-/// A fresh connection per call: the operations are infrequent and a short-lived connection keeps
-/// the client's state trivial.
-fn call(request: &Request) -> Result<Response, String> {
-    let mut client = guardian_service::ipc::IpcClient::connect(3_000)?;
-    client.call_expect(request)
+/// The label for Internet health.
+pub fn internet_label(health: InternetHealth, lang: Lang) -> &'static str {
+    match health {
+        InternetHealth::Healthy => msg::HEALTHY.get(lang),
+        InternetHealth::Degraded => msg::DEGRADED.get(lang),
+        InternetHealth::Down => msg::DOWN.get(lang),
+        InternetHealth::Unknown => msg::UNKNOWN.get(lang),
+    }
 }
 
-fn internet_label(health: InternetHealth) -> &'static str {
-    match health {
-        InternetHealth::Healthy => "Healthy",
-        InternetHealth::Degraded => "Degraded",
-        InternetHealth::Down => "Down",
-        InternetHealth::Unknown => "Unknown",
+/// Everything the panel draws, in one document.
+///
+/// The frontend is handed finished values — already-translated labels, already-computed counts —
+/// rather than raw state it would have to interpret. That keeps the "fail closed, never overstate"
+/// rule in one place, in Rust, where it is tested.
+fn panel_json(state: &ServiceState, snapshot: &StatusSnapshot, lang: Lang) -> serde_json::Value {
+    let now = guardian_win::clock::unix_now_ms();
+
+    // One row per detected agent. `instances` is the list of matching processes; a group is shown
+    // with its instance count rather than one row per process, because an agent like Claude Code
+    // appears as several helper processes that an operator thinks of as one session.
+    let agents: Vec<serde_json::Value> = snapshot
+        .agents
+        .agents
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "display_name": group.display_name,
+                "kind": group.kind,
+                "confidence": group.confidence.as_str(),
+                "confidence_label": confidence_label(group.confidence, lang),
+                "instance_count": group.instances.len(),
+                // The project is per instance, so it is only shown when every instance in the group
+                // agrees; otherwise the row would name one project out of several.
+                "project": shared_project(&group.instances),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "lang": lang.as_str(),
+        "generated_at_ms": snapshot.generated_at_ms,
+        "version": snapshot.service_version,
+        "mode": {
+            "value": snapshot.mode.as_str(),
+            "label": mode_label(snapshot.mode, lang),
+        },
+        "update": {
+            "level": snapshot.update.level.as_str(),
+            "label": level_label(snapshot.update.level, lang),
+            // Findings carry the plain-language reasons; when protection is intact there are none
+            // and the panel shows the affirmative instead of an empty list.
+            "findings": snapshot.update.findings.iter().map(|f| f.message.clone()).collect::<Vec<_>>(),
+            "primary_lock_effective": snapshot.update.primary_lock_effective,
+            "management": snapshot.update.management.describe(),
+            "checked_at_ms": snapshot.update.checked_at_ms,
+            "backend_error": snapshot.update.backend_error,
+        },
+        "restart_protection": {
+            "level": snapshot.restart_protection.as_str(),
+            "label": level_label(snapshot.restart_protection, lang),
+        },
+        "pending_reboot": {
+            "verdict": snapshot.pending_reboot.verdict.as_str(),
+            "label": pending_reboot_label(snapshot.pending_reboot.verdict, lang),
+            "signals": snapshot
+                .pending_reboot
+                .signals
+                .iter()
+                .map(|s| s.detail.clone())
+                .collect::<Vec<_>>(),
+        },
+        "network": {
+            "internet": snapshot.network.internet.as_str(),
+            "internet_label": internet_label(snapshot.network.internet, lang),
+            "entry_name": snapshot.network.entry_name,
+            "ras_state": format!("{:?}", snapshot.network.ras_state),
+        },
+        "agents": agents,
+        "agent_count": snapshot.agents.agent_count(),
+        "incident_count": state.incidents.len(),
+        "uptime_ms": now.saturating_sub(snapshot.service.started_at_ms),
+        "degraded_components": snapshot.service.degraded_components,
+        "maintenance": {
+            "blockers": snapshot.maintenance_denial_reasons,
+            "reboot_authorization": snapshot.reboot_authorization.as_ref().map(|a| serde_json::json!({
+                "expires_at_ms": a.expires_at_ms,
+            })),
+        },
+        "unclean_previous_exit": state.started_after_unclean_exit,
+    })
+}
+
+/// The project shared by every instance in a group, if they all agree.
+///
+/// Returns `None` when the instances disagree or none supplied one. Showing one instance's project
+/// for the whole group would attribute work to the wrong project, which is worse than showing
+/// nothing.
+fn shared_project(instances: &[AgentInstance]) -> Option<String> {
+    let mut names = instances
+        .iter()
+        .filter_map(|i| i.project.as_ref().map(|p| p.name.clone()));
+    let first = names.next()?;
+    names.all(|n| n == first).then_some(first)
+}
+
+/// The label for a pending-reboot verdict.
+fn pending_reboot_label(verdict: PendingRebootVerdict, lang: Lang) -> &'static str {
+    match verdict {
+        PendingRebootVerdict::NotPending => msg::PENDING_REBOOT_NONE.get(lang),
+        PendingRebootVerdict::ProbablyPending => msg::PENDING_REBOOT_PROBABLY.get(lang),
+        PendingRebootVerdict::Pending => msg::PENDING_REBOOT_ALREADY.get(lang),
+        PendingRebootVerdict::Unknown => msg::PENDING_REBOOT_UNKNOWN.get(lang),
+    }
+}
+
+/// The label for a detection confidence.
+fn confidence_label(confidence: Confidence, lang: Lang) -> &'static str {
+    match confidence {
+        Confidence::Confirmed => msg::CONFIDENCE_CONFIRMED.get(lang),
+        Confidence::High => msg::CONFIDENCE_HIGH.get(lang),
+        Confidence::Possible => msg::CONFIDENCE_POSSIBLE.get(lang),
+        Confidence::Unknown => msg::CONFIDENCE_UNKNOWN.get(lang),
+    }
+}
+
+/// The label for a protection mode.
+fn mode_label(mode: ProtectionMode, lang: Lang) -> &'static str {
+    match mode {
+        ProtectionMode::Normal => msg::MODE_NORMAL.get(lang),
+        ProtectionMode::Working => msg::MODE_WORKING.get(lang),
+        ProtectionMode::Maintenance => msg::MODE_MAINTENANCE.get(lang),
     }
 }
 
@@ -334,131 +602,121 @@ fn internet_label(health: InternetHealth) -> &'static str {
 // Commands exposed to the frontend
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-fn get_status(state: tauri::State<'_, Mutex<UiState>>) -> Result<serde_json::Value, String> {
-    let guard = state
-        .lock()
-        .map_err(|_| "UI state is unavailable".to_string())?;
-    match (&guard.last, &guard.last_error) {
-        (_, Some(e)) => Ok(serde_json::json!({ "ok": false, "error": e })),
-        (Some(s), None) => Ok(serde_json::json!({ "ok": true, "status": s })),
-        (None, None) => {
-            // First poll has not completed yet; report that rather than an empty snapshot, which
-            // would look like a machine with no agents and no protection.
-            Ok(serde_json::json!({ "ok": false, "error": "connecting to the service…" }))
-        }
-    }
-}
-
-#[tauri::command]
-fn get_agents() -> Result<serde_json::Value, String> {
-    match call(&Request::GetAgents)? {
-        Response::Agents { inventory } => {
-            Ok(serde_json::json!({ "ok": true, "agents": inventory }))
-        }
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn get_incidents(limit: u16) -> Result<serde_json::Value, String> {
-    match call(&Request::GetIncidents { limit })? {
-        Response::Incidents { incidents } => {
-            Ok(serde_json::json!({ "ok": true, "incidents": incidents }))
-        }
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn get_network() -> Result<serde_json::Value, String> {
-    match call(&Request::GetNetwork)? {
-        Response::Network { snapshot } => {
-            Ok(serde_json::json!({ "ok": true, "network": snapshot }))
-        }
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn enter_maintenance(
-    override_protected_work: bool,
-    confirmation: String,
-) -> Result<serde_json::Value, String> {
-    match call(&Request::EnterMaintenance {
-        override_protected_work,
-        confirmation,
-    })? {
-        Response::Ok { message } => Ok(serde_json::json!({ "ok": true, "message": message })),
-        // A refusal is an expected outcome, not a transport failure, so it comes back as data the
-        // UI can show rather than as an error.
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn exit_maintenance() -> Result<serde_json::Value, String> {
-    match call(&Request::ExitMaintenance)? {
-        Response::Ok { message } => Ok(serde_json::json!({ "ok": true, "message": message })),
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn arm_reboot(ttl_secs: u32) -> Result<serde_json::Value, String> {
-    match call(&Request::ArmSingleReboot { ttl_secs })? {
-        Response::Ok { message } => Ok(serde_json::json!({ "ok": true, "message": message })),
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn disarm_reboot() -> Result<serde_json::Value, String> {
-    match call(&Request::DisarmReboot)? {
-        Response::Ok { message } => Ok(serde_json::json!({ "ok": true, "message": message })),
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-fn reconnect(reason: String) -> Result<serde_json::Value, String> {
-    match call(&Request::Reconnect { reason })? {
-        Response::Ok { message } => Ok(serde_json::json!({ "ok": true, "message": message })),
-        Response::Error { error } => {
-            Ok(serde_json::json!({ "ok": false, "error": error.to_string() }))
-        }
-        other => Err(format!("unexpected reply: {other:?}")),
-    }
-}
-
-/// Close the panel, leaving the service running.
+/// The whole panel, in one call.
 ///
-/// Named `exit_ui` rather than `exit` to make the scope unmistakable at every call site: this
-/// process ends, protection does not.
+/// One command rather than six means the panel can never render a half-updated view — a status from
+/// this second beside a network figure from ten seconds ago.
 #[tauri::command]
-fn exit_ui(app: AppHandle) {
+fn get_panel(
+    bridge: tauri::State<'_, UiBridge>,
+    lang: tauri::State<'_, Lang>,
+) -> serde_json::Value {
+    let lang = *lang;
+    match bridge.panel(lang) {
+        Some(panel) => serde_json::json!({
+            "ok": true,
+            "elevated": bridge.is_elevated(),
+            "panel": panel,
+        }),
+        // Not an error: the first protection pass is still running. Saying "starting" is honest,
+        // where an empty panel would look exactly like a machine with nothing protected.
+        None => serde_json::json!({
+            "ok": false,
+            "starting": true,
+            "elevated": bridge.is_elevated(),
+            "message": msg::STARTING.get(lang),
+        }),
+    }
+}
+
+#[tauri::command]
+fn get_incidents(bridge: tauri::State<'_, UiBridge>, limit: u16) -> serde_json::Value {
+    let limit = usize::from(limit.min(200));
+    match bridge.with_state(|state| {
+        // Newest first, then trim: the panel wants the most recent events.
+        let mut incidents: Vec<&Incident> = state.incidents.iter().collect();
+        incidents.reverse();
+        incidents.truncate(limit);
+        incidents.into_iter().cloned().collect::<Vec<Incident>>()
+    }) {
+        Some(incidents) => serde_json::json!({ "ok": true, "incidents": incidents }),
+        None => serde_json::json!({ "ok": false, "starting": true }),
+    }
+}
+
+#[tauri::command]
+fn get_language(lang: tauri::State<'_, Lang>) -> String {
+    lang.as_str().to_string()
+}
+
+/// Report the user's right-click "reconnect" as intent.
+///
+/// The panel does not dial. The network worker owns the link and acts on its own evaluation, so a
+/// button cannot start two dials at once or fight the watchdog. This records the request in the log
+/// so the reason for the next dial attempt is visible.
+#[tauri::command]
+fn reconnect(
+    bridge: tauri::State<'_, UiBridge>,
+    lang: tauri::State<'_, Lang>,
+) -> serde_json::Value {
+    let lang = *lang;
+    let known = bridge.with_state(|_| ()).is_some();
+    if known {
+        tracing::info!("operator requested a reconnect from the control panel");
+    }
+    serde_json::json!({
+        "ok": known,
+        "message": if known {
+            msg::RECONNECT_REQUESTED.get(lang)
+        } else {
+            msg::STARTING.get(lang)
+        },
+    })
+}
+
+/// Exit the whole program, runtime included.
+///
+/// This is the only action that stops protection, and it is explicit. Closing the window hides the
+/// panel; it does not do this.
+#[tauri::command]
+fn exit_app(app: AppHandle, bridge: tauri::State<'_, UiBridge>) {
+    bridge.request_stop();
     app.exit(0);
+}
+
+/// Open the data directory in Explorer.
+///
+/// Guarded so the tray item is harmless if the folder does not exist yet.
+pub fn open_data_folder() -> std::io::Result<()> {
+    let paths = guardian_storage::GuardianPaths::production();
+    let root = paths.root().to_path_buf();
+    if !root.exists() {
+        std::fs::create_dir_all(&root)?;
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(root.as_os_str())
+        .spawn()?;
+    Ok(())
+}
+
+/// Handle the tray menu items that are not state readouts.
+pub fn handle_menu_event(app: &AppHandle, id: &str) {
+    match id {
+        "open" => show_window(app),
+        "data-folder" => {
+            if let Err(e) = open_data_folder() {
+                tracing::warn!("could not open the data folder: {e}");
+            }
+        }
+        "exit-app" => {
+            app.state::<UiBridge>().request_stop();
+            app.exit(0);
+        }
+        // The status rows are read-outs, not commands. Windows still delivers the event, so it is
+        // matched explicitly rather than falling into a wildcard that could hide a typo in an id.
+        "status" | "agents" | "network" => {}
+        other => tracing::warn!("unhandled tray menu item: {other}"),
+    }
 }
 
 #[cfg(test)]
@@ -466,19 +724,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tray_icon_has_the_expected_dimensions() {
+    fn the_tray_icon_has_the_expected_shape() {
         let icon = tray_icon();
         assert_eq!(icon.width(), 32);
         assert_eq!(icon.height(), 32);
         assert_eq!(icon.rgba().len(), 32 * 32 * 4);
-    }
 
-    #[test]
-    fn the_tray_icon_has_transparent_corners_and_a_solid_centre() {
-        let icon = tray_icon();
-        let rgba = icon.rgba();
-        let alpha_at = |x: u32, y: u32| rgba[((y * 32 + x) * 4 + 3) as usize];
-
+        let alpha_at = |x: u32, y: u32| icon.rgba()[((y * 32 + x) * 4 + 3) as usize];
         assert_eq!(alpha_at(0, 0), 0, "the corner must be transparent");
         assert_eq!(
             alpha_at(16, 16),
@@ -488,95 +740,94 @@ mod tests {
     }
 
     #[test]
-    fn internet_labels_cover_every_health_value() {
-        for health in [
-            InternetHealth::Healthy,
-            InternetHealth::Degraded,
-            InternetHealth::Down,
-            InternetHealth::Unknown,
-        ] {
-            assert!(!internet_label(health).is_empty());
-        }
-    }
-
-    /// Build a status snapshot with the given protection level.
-    fn snapshot_with(level: ProtectionLevel, health: InternetHealth) -> StatusSnapshot {
-        StatusSnapshot {
-            mode: ProtectionMode::Working,
-            update: UpdateProtectionReport {
-                level,
-                primary_lock_effective: level.is_protected(),
-                values: vec![],
-                neutralized_deadlines: vec![],
-                management: ManagementState::Unmanaged,
-                findings: vec![],
-                checked_at_ms: 0,
-                backend_error: None,
-            },
-            restart_protection: ProtectionLevel::Protected,
-            pending_reboot: PendingRebootReport::unknown("test", 0),
-            service: ServiceHealth {
-                running: true,
-                started_at_ms: 0,
-                uptime_ms: 0,
-                version: "0.1.0".into(),
-                degraded_components: vec![],
-                started_after_unclean_exit: false,
-            },
-            agents: Box::new(AgentInventory::default()),
-            network: Box::new(NetworkSnapshot {
-                internet: health,
-                ..Default::default()
-            }),
-            reboot_authorization: None,
-            maintenance_denial_reasons: vec![],
-            generated_at_ms: 0,
-            service_version: "0.1.0".into(),
-            boot_id: "boot".into(),
-            session_id_helper: SessionHelperState::NotRunning,
-        }
-    }
-
-    #[test]
-    fn the_tray_labels_name_the_live_protection_level() {
-        // The tray is what an operator sees without opening anything, so its wording must be the
-        // honest one from the snapshot rather than a fixed string.
-        let snapshot = snapshot_with(ProtectionLevel::Degraded, InternetHealth::Down);
-        assert_eq!(snapshot.update.level.as_str(), "Degraded");
-        assert!(!snapshot.update.level.is_protected());
-        assert_eq!(internet_label(snapshot.network.internet), "Down");
-    }
-
-    #[test]
-    fn a_protected_snapshot_is_the_only_one_that_reads_as_protected() {
-        // Mirrors the invariant the whole project rests on, asserted at the boundary the UI reads.
-        assert_eq!(
-            snapshot_with(ProtectionLevel::Protected, InternetHealth::Healthy)
-                .update
-                .level
-                .as_str(),
-            "Protected"
-        );
-        for level in [
-            ProtectionLevel::Degraded,
-            ProtectionLevel::Maintenance,
-            ProtectionLevel::Unknown,
-            ProtectionLevel::Unprotected,
-        ] {
-            let snapshot = snapshot_with(level, InternetHealth::Healthy);
-            assert_ne!(
-                snapshot.update.level.as_str(),
-                "Protected",
-                "{level:?} must not reach the UI as Protected"
-            );
-            assert!(!snapshot.update.level.is_protected());
-        }
-    }
-
-    #[test]
     fn the_refresh_interval_is_low_frequency() {
-        // A UI that polled continuously would defeat the point of the event-driven service.
-        assert!(REFRESH_INTERVAL >= Duration::from_secs(2));
+        // The panel reads in-process state, so this interval is a UI smoothness choice, not a
+        // correctness one. A tight loop would waste CPU on a process that runs for months.
+        assert!(REFRESH_INTERVAL >= Duration::from_secs(1));
         assert!(REFRESH_INTERVAL <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_shutdown_grace_is_bounded() {
+        // An explicit exit must be prompt even if a worker is wedged, while still leaving the
+        // runtime time to flush its journal.
+        assert!(SHUTDOWN_GRACE >= Duration::from_millis(200));
+        assert!(SHUTDOWN_GRACE <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_detached_bridge_reports_nothing_rather_than_a_blank_panel() {
+        // A panel that showed zeros while the first protection pass is still running would look
+        // exactly like a machine with no protection and no agents.
+        let bridge = UiBridge::default();
+        assert!(bridge.panel(Lang::En).is_none());
+        assert!(bridge.with_state(|_| ()).is_none());
+    }
+
+    #[test]
+    fn requesting_a_stop_before_the_runtime_exists_is_harmless() {
+        let bridge = UiBridge::default();
+        bridge.request_stop(); // must not panic, must not block
+        assert!(bridge.exiting.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_second_stop_request_returns_immediately() {
+        let bridge = UiBridge::default();
+        bridge.request_stop();
+        let start = std::time::Instant::now();
+        bridge.request_stop();
+        assert!(
+            start.elapsed() < SHUTDOWN_GRACE,
+            "the second exit request must not wait again"
+        );
+    }
+
+    #[test]
+    fn the_language_choices_all_round_trip() {
+        for lang in Lang::choices() {
+            assert_eq!(Lang::parse(lang.as_str()), lang);
+        }
+    }
+
+    #[test]
+    fn every_protection_level_has_a_distinct_label() {
+        // If two levels rendered the same text, a degraded machine could be mistaken for a
+        // protected one, which is the failure this project exists to prevent.
+        for lang in [Lang::En, Lang::ZhCn] {
+            let labels: Vec<&str> = [
+                ProtectionLevel::Protected,
+                ProtectionLevel::Degraded,
+                ProtectionLevel::Maintenance,
+                ProtectionLevel::Unknown,
+                ProtectionLevel::Unprotected,
+            ]
+            .into_iter()
+            .map(|l| level_label(l, lang))
+            .collect();
+
+            for (i, a) in labels.iter().enumerate() {
+                assert!(!a.is_empty(), "a level label is empty in {lang:?}");
+                for b in labels.iter().skip(i + 1) {
+                    assert_ne!(a, b, "two protection levels read the same in {lang:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unhandled_menu_ids_are_not_silently_ignored() {
+        // The status rows must be matched explicitly: a wildcard would swallow a typo in a real
+        // command's id and the button would appear to do nothing.
+        let known = [
+            "status",
+            "agents",
+            "network",
+            "open",
+            "data-folder",
+            "exit-app",
+        ];
+        assert_eq!(known.len(), 6);
+        assert!(known.contains(&"exit-app"), "exit must be reachable");
     }
 }

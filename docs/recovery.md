@@ -2,7 +2,7 @@
 
 ## What this subsystem is for
 
-On every service start, determine whether the **previous** session ended cleanly. If it did not,
+On every start, determine whether the **previous** session ended cleanly. If it did not,
 work may have been lost, and the operator deserves to know what was running and why it stopped.
 
 That is the difference between "the machine rebooted overnight" and "your four agents were killed
@@ -18,7 +18,7 @@ magic:u32 | length:u32 | crc32:u32 | payload
 
 A torn tail — which is what power loss actually produces — fails the length or checksum check and
 is **discarded**, not parsed as data. A corrupt journal degrades recovery information; it never
-prevents the service from starting.
+prevents the runtime from starting.
 
 Record kinds: session start, checkpoint, mode change, policy tamper, shutdown observed, clean
 shutdown, worker failure, network event.
@@ -41,7 +41,7 @@ shutdown — are written **synchronously**.
 ### The clean-shutdown marker
 
 Its presence is the only thing that makes the next boot treat this session as clean. It is written
-from the service's stop path and from preshutdown, with a synchronous flush.
+from the runtime's stop path, with a synchronous flush.
 
 An earlier revision had a subtle bug here worth recording, because it is the kind of thing that
 would quietly destroy trust in the whole recovery report: journal rotation moved the session-start

@@ -24,8 +24,10 @@
 pub mod ipc;
 pub mod journal;
 pub mod logging;
+pub mod runtime;
 pub mod state;
 pub mod supervisor;
 
+pub use runtime::{run, GuardianRuntime, RuntimeOptions};
 pub use state::{ProtectionCoordinator, SharedState};
 pub use supervisor::{Supervisor, WorkerHealth};

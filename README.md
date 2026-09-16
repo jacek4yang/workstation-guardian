@@ -43,25 +43,45 @@ metadata reduces the loss.
 ### Requirements
 
 * Windows 11 x64.
-* Administrator rights to install (the service runs as `LocalSystem`).
+* **Administrator rights.** Update protection is a machine-wide policy write, so Guardian
+  must run elevated. Without them it still starts and reports honestly — update protection
+  reads `Unknown` rather than claiming a lock it could not apply.
 * WebView2, which ships with Windows 11.
 
 ### Install
 
+There is nothing to install. Guardian is a single tray application: it registers no Windows
+service, creates no scheduled task, adds no autostart entry, and writes nothing outside its
+own data directory and the one Windows Update policy key it owns.
+
 ```powershell
-# From an elevated prompt, in the directory containing the binaries:
-.\guardianctl.exe install
+# Just run it. Accept the UAC prompt so protection can be applied.
+.\guardian-ui.exe
 ```
 
-This registers the service as an automatic-start service, configures SCM recovery so it
-restarts itself if it fails (never a reboot action), writes a default configuration that
-protects updates, starts the service, and verifies the result.
+The first run writes a default configuration to
+`%ProgramData%\WorkstationGuardian\config.json`, applies the update policy, and shows a tray
+icon. That file is yours to edit; Guardian never overwrites it afterwards.
 
-Then verify:
+To verify from a command line:
 
 ```powershell
 .\guardianctl.exe doctor
 ```
+
+### Running it
+
+The tray icon is the program's presence, and it stays until you close it:
+
+* **Left click** opens the control panel. **Closing the window hides it to the tray** —
+  protection continues either way, because the panel is not the program.
+* **Right click** shows a menu with the live status, the data folder, and **Exit Guardian**.
+* Only an explicit exit stops protection. It shuts down cleanly, writing the journal's
+  clean-shutdown marker so the next start does not misreport this as a crash.
+
+Guardian does not add itself to startup. If you want it running after a reboot, put a
+shortcut to `guardian-ui.exe` in `shell:startup` yourself — that is your decision to make,
+not one Guardian makes silently.
 
 ### Optional: logon helper
 
@@ -95,8 +115,8 @@ guardianctl status --json   # machine-readable
 ```
 
 The tray icon shows the same information without opening anything. **Closing the control
-panel hides it to the tray**; protection continues. **Exit UI** stops the panel only — the
-service is unaffected, by design.
+panel hides it to the tray**; protection continues. Only **Exit Guardian** stops protection,
+and it says so in the panel before it does anything.
 
 ---
 
@@ -234,28 +254,37 @@ guardianctl doctor --json   # the same, machine-readable
 
 None of these require PowerShell, `reg.exe`, or `sc.exe`.
 
-`guardianctl doctor` works **without the service running**, which is exactly when you need it.
-It checks service installation and reachability, session helper, IPC, Windows Update policy,
+`guardianctl doctor` works **without Guardian running**, which is exactly when you need it.
+It checks whether the runtime answers, session helper, elevation, Windows Update policy,
 conflicting external policy, pending reboot, RAS entries, entry selection, connectivity probes,
-process monitor, storage and journal health, log health, elevation, and current mode.
+process monitor, storage and journal health, and log health.
+
+`--lang zh-CN` renders the output in Chinese; without it, the language comes from your
+configuration, which defaults to your system locale.
 
 ---
 
 ## Uninstallation
 
-```powershell
-# From an elevated prompt:
-.\guardianctl.exe uninstall
-```
+There is no uninstaller, because there is nothing installed. To remove Guardian:
 
-This stops and removes the service, then restores **only the policy values Guardian itself
-recorded setting**. Values belonging to Group Policy or MDM are never touched, because
-Guardian never recorded owning them.
+1. **Exit Guardian** from the tray menu. This is the only step that requires the program.
+2. Restore the update policy Guardian wrote:
 
-* Uninstall **never reboots** the machine.
-* `--keep-policy` leaves update policy in place if you want it to stay locked.
-* State and logs remain under `%ProgramData%\WorkstationGuardian` for inspection; delete that
-  directory to remove them.
+   ```powershell
+   # From an elevated prompt:
+   .\guardianctl.exe restore-policy
+   ```
+
+   This restores **only the policy values Guardian itself recorded setting**. Values
+   belonging to Group Policy or MDM are never touched, because Guardian never recorded owning
+   them. If the rollback metadata cannot be read, it refuses to guess and tells you so.
+3. Delete the folder you extracted the binaries into, and optionally
+   `%ProgramData%\WorkstationGuardian`.
+
+* Nothing here **reboots** the machine.
+* `restore-policy` is the only Guardian command that *reduces* protection, which is why it is
+  named for what it does and is never a side effect of deleting files.
 
 ---
 
@@ -264,25 +293,21 @@ Guardian never recorded owning them.
 ```text
 guardianctl <command> [--json] [options]
 
-  status        Overall protection, network and agent state
-  agents        Detected AI coding agents and protected workloads
-  network       PPPoE and Wi-Fi state, including outage history
-  update        Windows Update protection state and policy detail
-  incidents     Recorded incidents, newest first
-  doctor        Full diagnostic sweep of every subsystem
-  install       Install the service and supporting components
-  uninstall     Remove the service and report policy restoration
-  start         Start the service
-  stop          Stop the service
+  status           Overall protection, network and agent state
+  agents           Detected AI coding agents and protected workloads
+  network          PPPoE and Wi-Fi state, including outage history
+  update           Windows Update protection state and policy detail
+  incidents        Recorded incidents, newest first
+  doctor           Full diagnostic sweep of every subsystem
+  restore-policy   Undo the Windows Update policy Guardian wrote
 
-  --json        Machine-readable output
-  --limit <n>   Maximum incidents to show (default 50)
-  --force       Reinstall even if already installed
-  --keep-policy Leave update policy in place when uninstalling
+  --json           Machine-readable output
+  --limit <n>      Maximum incidents to show (default 50)
+  --lang <code>    auto, en, zh-CN (default: from configuration)
 ```
 
-Stopping the service requires an explicit administrative action. Nothing in the UI can stop it,
-and **Exit UI** affects only the panel.
+Guardian runs as a tray application, so there is no service to install, start or stop. Only
+**Exit Guardian** stops protection, and only an explicit click reaches it.
 
 ---
 

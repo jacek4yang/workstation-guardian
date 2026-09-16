@@ -46,11 +46,13 @@ Completed subsystems, each committed with its tests green:
    loop that implements "broadband primary, Wi-Fi continuity, repair in parallel".
 
 6. **guardian-update** — verification loop, tamper detection, incident recording.
-7. **guardian-service** — supervisor with per-worker restart, state coordinator, IPC server,
-   recovery journal, preshutdown handling, bounded structured logging.
+7. **guardian-service** — the hosted runtime: supervisor with per-worker restart, state
+   coordinator, IPC server, recovery journal, bounded structured logging. Exposes
+   `runtime::run()` so a host can embed it.
 8. **guardian-session** — the per-user shutdown blocker.
-9. **guardianctl** — diagnostics, SCM control, installation and uninstallation.
-10. **guardian-ui** — Tauri v2 tray and control panel.
+9. **guardianctl** — diagnostics and policy restoration.
+10. **guardian-ui** — the program: a Tauri v2 tray application that hosts the runtime in its
+    own process. No Windows service is registered.
 11. **Documentation** — README plus seven documents under `docs/`.
 12. **CI and packaging** — GitHub Actions on Windows, and a redistributable archive.
 
@@ -58,13 +60,30 @@ Completed subsystems, each committed with its tests green:
 
 Released as [v0.1.0](https://github.com/jacek4yang/workstation-guardian/releases/tag/v0.1.0).
 
-Verified on this workstation (Windows 11 Pro 10.0.26200): update protection reads `Protected`
-with zero registry writes on a conformant machine; the detector reports exactly the five running
-agents Windows reports, with their real project names and no false positives; the PPPoE entry
-`宽带连接` is enumerated and auto-selected; connectivity is judged by quorum across four probes on
-a network that filters direct connections to public resolver IPs.
+Verified on this workstation (Windows 11 Pro 10.0.26200): the tray application hosts the runtime
+in-process, and `guardianctl status` against it reports live data — 1 Claude Code session and 4
+Grok Build sessions with their real project names, the PPPoE entry `宽带连接` enumerated and
+connected, and update protection `Protected` with zero registry writes on a conformant machine.
+Connectivity is judged by the single `223.5.5.5:443` probe.
 
-595 tests pass with no clippy warnings.
+564 tests pass with no clippy warnings.
+
+### Architectural revision: no Windows service
+
+The original design ran the core authority as a `LocalSystem` Windows service. It was replaced by
+a single elevated tray application at the operator's request, for a reason worth recording: the
+service was privilege the design did not need. Update protection is a write to
+`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`, which administrators can do.
+
+What the change cost, stated honestly:
+
+* No SCM to restart Guardian after a crash, so the in-process supervisor is now the only thing
+  between a worker bug and an unprotected machine.
+* No `SERVICE_ACCEPT_PRESHUTDOWN`, so there is no early warning before a shutdown. The journal
+  checkpoint interval bounds the worst case instead.
+* Protection ends if the operator exits the program. That is the intended trade: the tray icon is
+  visible, and stopping it is a deliberate, confirmed act rather than something that can happen
+  by accident.
 
 ## Findings worth remembering
 
@@ -99,3 +118,6 @@ visible by reading the code, and several would have shipped.
 | A freshly dialled link was torn down and re-dialled forever on a filtered network | Running against this campus network |
 | Backoff reset on every attempt, producing a dial loop | The same run |
 | Log pruning could delete the live log | A bounds test |
+| The helper check reported `pass` beside a detail saying the helper was not running | Reading `guardianctl doctor` output after the tray pivot |
+| A test asserted no pipe listener exists, which fails whenever Guardian is running | Running the suite with the tray application up |
+| Startup logic was duplicated between the CLI installer and the runtime, so the runtime never wrote a default configuration | Removing the installer |

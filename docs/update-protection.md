@@ -20,7 +20,7 @@ restart despite the above (`SetAutoRestartDeadline`, `SetAutoRestartNotification
 A deadline policy is neutralized by being zero **or absent** — a value that does not exist cannot
 force anything. Using absence as an acceptable state is not a shortcut: treating an absent value as
 an unmet requirement made every stock Windows machine report `Degraded` forever, and made the
-service write three zeros on every pass for no benefit.
+runtime write three zeros on every pass for no benefit.
 
 ## What Guardian does not do
 

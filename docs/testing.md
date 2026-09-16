@@ -79,15 +79,15 @@ Recorded because they justify the approach — none of these were visible by rea
 | Defect | Found by |
 |---|---|
 | The pipe ACL was unusable, not merely tight: every client open was denied | Running an actual client against the server |
-| `ConnectNamedPipe` ignores timeouts on a blocking pipe, so the accept loop could hang a service stop | A test that hung |
+| `ConnectNamedPipe` ignores timeouts on a blocking pipe, so the accept loop could hang a shutdown | A test that hung |
 | `REG_MULTI_SZ` decoding stopped at the first NUL, silently truncating multi-strings | Registry round-trip test |
 | MDM detection reported a managed machine that was not managed | Running `guardianctl update` on a real workstation |
 | Absent deadline policies were reported as hazards *and* written as zeros on every pass | The same run |
 | `Response` could not serialize `Incidents` at all — serde cannot internally-tag a newtype variant holding a sequence | A real IPC round trip |
-| The accept timeout destroyed arriving connections, which looked like the service dying | A sequential-request test |
+| The accept timeout destroyed arriving connections, which looked like Guardian dying | A sequential-request test |
 | A second pipe instance could not be created by a non-elevated user | Bisecting an access-denied failure on the OS |
 | `OpenEventLogW` silently opens a *different* log for a nonexistent channel | A channel-existence test |
-| "Does the process have a console" is not a valid service check | A test run with no console |
+| "Does the process have a console" is not a valid way to detect a service | A test run with no console |
 | A freshly dialled link was torn down and re-dialled forever on a filtered network | Running against a real campus network |
 | Backoff reset on every dial attempt, producing a dial loop at the initial interval | The same run |
 | Log pruning could delete the live log file | A bounds test |

@@ -296,8 +296,19 @@ impl NetworkObservation {
     }
 
     /// Whether a quorum of probes passed.
+    ///
+    /// The requirement is clamped to the number of probes that actually ran. Without that, a
+    /// configuration with one probe and a quorum of two could never be satisfied, so a perfectly
+    /// healthy link would be reported down forever - and the dial logic would keep retrying it.
     pub fn quorum_ok(&self, required: u32) -> bool {
-        self.passes() >= required as usize
+        let ran = self.total();
+        if ran == 0 {
+            // Nothing was measured. That is not evidence of failure; the caller decides what an
+            // unmeasured round means.
+            return false;
+        }
+        let needed = (required as usize).clamp(1, ran);
+        self.passes() >= needed
     }
 
     /// Whether name resolution is the specific thing failing.
@@ -673,19 +684,37 @@ pub fn evaluate(
     let probes_prove_path = obs.total() == 0 || obs.quorum_ok(policy.failure_quorum);
     let link_proven = link_up && probes_prove_path;
 
-    // While a link is still being verified, unproven probes are not treated as failure: the
-    // verification window exists precisely to give a new link time to settle.
-    let settling = matches!(
+    // Whether this session has already had its chance to settle.
+    //
+    // The first version of this only excluded the states that *mean* "a dial is in progress"
+    // (`Connecting`, `Authenticating`, `Verifying`). That missed the path a reconnect actually
+    // takes: after an outage the state is `Reconnecting`, RAS comes up, and the first probe has not
+    // yet had time to succeed. `Reconnecting` was therefore judged on probe evidence alone,
+    // declared degraded, and - because Wi-Fi was carrying traffic - hung up seconds after
+    // connecting. The symptom was a link that connected and was killed over and over, logged as
+    // `cleaning up an unusable broadband session (PPPOE_SESSION_LOST)`.
+    //
+    // The correct question is not "which state did we come from" but "has this session had its
+    // window yet". A session that has just appeared has not, whatever we were doing before. Only a
+    // link that was already established can be judged on probe evidence alone, because only then
+    // does a probe failure carry information that the link itself was working.
+    //
+    // Note that `Degraded` counts as established: it means "this link was judged and failed", so
+    // letting it back in on link evidence would make a pathological flapping link impossible to
+    // give up on.
+    let already_established = matches!(
         state.broadband,
-        BroadbandState::Verifying | BroadbandState::Connecting | BroadbandState::Authenticating
+        BroadbandState::Healthy | BroadbandState::Degraded
     );
 
-    let broadband_usable = if settling {
-        link_up
-    } else {
+    let broadband_usable = if already_established {
         // An established link must keep passing its probes; that is what detects a path that has
         // genuinely stopped working while the session stayed up.
         link_proven
+    } else {
+        // A link that has just come up is judged on link evidence alone until it has had its
+        // verification window.
+        link_up
     };
 
     if policy.wifi_enabled {
@@ -773,7 +802,23 @@ pub fn evaluate(
 
         if s.consecutive_failures >= policy.failure_quorum {
             match s.broadband {
-                BroadbandState::Healthy | BroadbandState::Verifying => {
+                // Inside the verification window: the window exists precisely so that a probe
+                // failure right after a dial does not count against a link that has had no chance
+                // to prove itself.
+                //
+                // This is the second half of the reconnect defect. Letting a just-connected link
+                // through on link evidence moves it to `Verifying` - and this branch was then
+                // demoting it straight back to `Degraded` on the next failing probe, because
+                // `Verifying` was grouped with `Healthy`. The window never actually existed for the
+                // case it was written for. On a network where the probe always fails, the link was
+                // torn down and re-dialled forever.
+                BroadbandState::Verifying => {
+                    notes.push(format!(
+                        "broadband still verifying; not demoting on probe evidence yet ({})",
+                        kind.as_str()
+                    ));
+                }
+                BroadbandState::Healthy => {
                     // Demote. If we were promoted, remember the abort so the next
                     // verification window is longer.
                     if previously_healthy && state.broadband_preferred_since_ms.is_some() {
@@ -825,7 +870,28 @@ pub fn evaluate(
     //
     // The continuation constraint applies to (b): hanging up is only safe once something
     // else is actually carrying traffic, or nothing was carrying it to begin with.
-    let need_repair = !broadband_ok_now;
+    // A link that is inside its verification window is not repaired on probe evidence alone.
+    //
+    // The window is the whole reason a freshly dialled link is judged on link-layer evidence:
+    // on a network that filters the probes, every probe fails while the link is perfectly fine, so
+    // acting on those failures would tear down a working connection seconds after bringing it up.
+    // That is exactly what happened in practice - the log filled with
+    // `cleaning up an unusable broadband session (PPPOE_SESSION_LOST)` and the link never
+    // stabilised, because each new session was killed before it could prove itself.
+    //
+    // The test is elapsed time rather than the state name, because the state name is what was
+    // wrong before: `Reconnecting` and `Verifying` both mean "recently dialled", and a link that
+    // has been verifying for longer than its window *should* be given up on.
+    let window_ms = (policy.stabilize_secs * (1 + s.recent_aborts as u64) * 1000) as i64;
+    let verifying_for_ms = match (s.broadband, s.broadband_healthy_since_ms) {
+        // Only the window states are protected. An `Unconfigured` link has no session to protect,
+        // and a `Failed` one is intentionally left alone.
+        (BroadbandState::Verifying | BroadbandState::Reconnecting, Some(since)) => now_ms - since,
+        _ => i64::MAX,
+    };
+    let inside_verification_window = verifying_for_ms < window_ms;
+
+    let need_repair = !broadband_ok_now && !inside_verification_window;
     if need_repair {
         let kind = s.failure_kind.unwrap_or(BroadbandFailureKind::Unknown);
 
@@ -1610,6 +1676,69 @@ mod tests {
         assert!(
             !dialled_again,
             "and it must certainly not be re-dialled in a loop"
+        );
+    }
+
+    #[test]
+    fn a_link_that_connects_from_reconnecting_is_not_torn_down_by_one_failed_probe() {
+        use crate::net::*;
+
+        // Regression, found by running against this campus network with the production probe
+        // configuration (a single 223.5.5.5:443 probe).
+        //
+        // The earlier fix covered a link that was *already* in a settling state. It missed the
+        // path that actually happens after an outage: the state is `Reconnecting`, RAS reports
+        // the session up, and the first probe has not yet had time to succeed. `Reconnecting` is
+        // not in the settling set, so the link was judged on probe evidence alone, declared
+        // degraded, and - because Wi-Fi was carrying traffic - hung up seconds after connecting.
+        //
+        // The observed symptom was a link that connected and was killed over and over, with the
+        // log full of "cleaning up an unusable broadband session (PPPOE_SESSION_LOST)". Guardian
+        // must never deliberately drop a link it just brought up.
+        let policy = NetworkPolicy {
+            failure_quorum: 1,
+            success_quorum: 1,
+            ..Default::default()
+        };
+
+        // Session up with a real address and a real default route; the probe has not passed yet.
+        let obs = NetworkObservation {
+            ras_connected: true,
+            broadband_has_ip: true,
+            broadband_default_route: true,
+            wifi_connected: true,
+            wifi_has_ip: true,
+            probe_results: vec![ProbeOutcome {
+                id: "alidns-tcp".into(),
+                kind: ProbeKind::Tcp,
+                ok: false,
+                latency_ms: None,
+                error: Some("timed out".into()),
+            }],
+            ..Default::default()
+        };
+
+        // The state left behind by an outage, which is where a reconnect actually starts.
+        let mut state = NetworkState {
+            broadband: BroadbandState::Reconnecting,
+            ..Default::default()
+        };
+
+        let mut hung_up = false;
+        for round in 0..4 {
+            let t = evaluate(&state, &obs, &policy, 1_000 + round * 1_000);
+            if t.actions
+                .iter()
+                .any(|a| matches!(a, NetworkAction::HangUpBroadband))
+            {
+                hung_up = true;
+            }
+            state = t.state;
+        }
+
+        assert!(
+            !hung_up,
+            "a link that has just connected must be given its verification window before any              probe failure can justify tearing it down"
         );
     }
 

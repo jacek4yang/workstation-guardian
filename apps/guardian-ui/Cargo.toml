@@ -12,6 +12,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 guardian-proto.workspace = true
 guardian-core.workspace = true
+guardian-storage.workspace = true
+guardian-win.workspace = true
 guardian-service.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde.workspace = true

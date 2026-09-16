@@ -1,11 +1,16 @@
-//! `guardianctl` — diagnostics, installation and service control.
+//! `guardianctl` — diagnostics for Workstation Guardian.
 //!
 //! Operates in two modes:
 //!
-//! * **Offline** (no arguments that need the service): reads system state directly. This is what
-//!   makes `guardianctl doctor` work when the service is *not* running, which is exactly when it
-//!   is most needed.
-//! * **Online**: talks to the running service over the named pipe.
+//! * **Offline** (no arguments that need the runtime): reads system state directly. This is what
+//!   makes `guardianctl doctor` work when Guardian is *not* running, which is exactly when it is
+//!   most needed.
+//! * **Online**: talks to the running Guardian over its named pipe.
+//!
+//! There is no `install` or `uninstall`: Guardian registers no Windows service and creates no
+//! scheduled task. It is a tray application, so running it is the whole installation. The one thing
+//! that does need undoing — the Windows Update policy it writes — is reached through
+//! `restore-policy`, which is explicit and never a side effect of deleting files.
 //!
 //! No routine diagnostic requires PowerShell, `sc.exe`, `reg.exe` or any other external tool.
 
@@ -17,29 +22,41 @@ mod output;
 
 use std::process::ExitCode;
 
+use guardian_proto::i18n::Lang;
 use guardian_proto::{Request, Response};
 
 /// Command-line surface. Hand-parsed: the shape is small and fixed, and this avoids a
 /// dependency whose version churn would have to be tracked for no benefit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Status { json: bool },
-    Agents { json: bool },
-    Network { json: bool },
-    Update { json: bool },
-    Incidents { json: bool, limit: u16 },
-    Doctor { json: bool },
-    Install { force: bool },
-    Uninstall { keep_policy: bool },
-    Start,
-    Stop,
+    Status {
+        json: bool,
+    },
+    Agents {
+        json: bool,
+    },
+    Network {
+        json: bool,
+    },
+    Update {
+        json: bool,
+    },
+    Incidents {
+        json: bool,
+        limit: u16,
+    },
+    Doctor {
+        json: bool,
+    },
+    /// Undo the Windows Update policy Guardian wrote. The only protection-reducing command.
+    RestorePolicy,
     Help,
     Version,
 }
 
 impl Command {
-    /// Whether this command needs the service to be running.
-    pub fn needs_service(&self) -> bool {
+    /// Whether this command needs the runtime to be running.
+    pub fn needs_runtime(&self) -> bool {
         matches!(
             self,
             Command::Status { .. }
@@ -75,19 +92,18 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let rest = &args[1..];
 
     let json = rest.iter().any(|a| a == "--json");
-    let force = rest.iter().any(|a| a == "--force");
-    let keep_policy = rest.iter().any(|a| a == "--keep-policy");
 
     // Reject anything that is not a flag we understand, so a typo is caught here rather than
-    // changing behaviour silently. `--limit` takes a value, so its argument is skipped.
+    // changing behaviour silently. `--limit` and `--lang` take values, so their arguments are
+    // skipped.
     let mut index = 0usize;
     while index < rest.len() {
         let a = rest[index].as_str();
         match a {
-            "--json" | "--force" | "--keep-policy" => {}
-            "--limit" => {
-                // The value is validated below; here we only need to know it was consumed so it
-                // is not mistaken for an unknown flag.
+            "--json" => {}
+            "--lang" | "--limit" => {
+                // Consumed, with their value checked below where it matters. Skipping the value
+                // here stops it being mistaken for an unknown flag.
                 index += 1;
             }
             other if other.starts_with("--") => {
@@ -113,10 +129,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         "update" => Ok(Command::Update { json }),
         "incidents" => Ok(Command::Incidents { json, limit }),
         "doctor" => Ok(Command::Doctor { json }),
-        "install" => Ok(Command::Install { force }),
-        "uninstall" => Ok(Command::Uninstall { keep_policy }),
-        "start" => Ok(Command::Start),
-        "stop" => Ok(Command::Stop),
+        "restore-policy" => Ok(Command::RestorePolicy),
         "help" | "--help" | "-h" => Ok(Command::Help),
         "version" | "--version" | "-V" => Ok(Command::Version),
         other => Err(format!(
@@ -127,37 +140,55 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
 
 fn help_text() -> &'static str {
     "\
-guardianctl — Workstation Guardian diagnostics and control
+guardianctl — Workstation Guardian diagnostics
 
 USAGE:
     guardianctl <command> [--json] [options]
 
 COMMANDS:
-    status        Overall protection, network and agent state
-    agents        Detected AI coding agents and protected workloads
-    network       PPPoE and Wi-Fi state, including outage history
-    update        Windows Update protection state and policy detail
-    incidents     Recorded incidents, newest first
-    doctor        Full diagnostic sweep of every subsystem
-    install       Install the service and supporting components
-    uninstall     Remove the service and report policy restoration
-    start         Start the service
-    stop          Stop the service
-    help          Show this text
-    version       Show the version
+    status           Overall protection, network and agent state
+    agents           Detected AI coding agents and protected workloads
+    network          PPPoE and Wi-Fi state, including outage history
+    update           Windows Update protection state and policy detail
+    incidents        Recorded incidents, newest first
+    doctor           Full diagnostic sweep of every subsystem
+    restore-policy   Undo the Windows Update policy Guardian wrote
+    help             Show this text
+    version          Show the version
 
 OPTIONS:
     --json              Machine-readable output
     --limit <n>         Maximum incidents to show (default 50)
-    --force             Reinstall even if already installed
-    --keep-policy       Leave update policy in place when uninstalling
+    --lang <code>       Language: auto, en, zh-CN (default: from configuration)
 
+Guardian runs as a tray application; there is no service to install or start.
 Diagnostics never require PowerShell, reg.exe or sc.exe. Output is local only:
 nothing is uploaded."
 }
 
+/// Read the value of a `--flag value` pair from the argument list.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == flag)?;
+    args.get(i + 1).cloned()
+}
+
+/// The language to render in.
+///
+/// Read from the machine configuration, so the CLI and the tray panel agree. A missing or corrupt
+/// file yields `Auto`, which follows the operating system.
+fn configured_language() -> Lang {
+    let paths = guardian_storage::GuardianPaths::production();
+    match std::fs::read_to_string(paths.config_file()) {
+        Ok(text) => {
+            let validated = guardian_core::config::load_from_str(&text);
+            validated.document.body.language
+        }
+        Err(_) => Lang::Auto,
+    }
+}
+
 /// Run a command that requires the service.
-fn run_online(command: &Command, json: bool) -> Result<String, String> {
+fn run_online(command: &Command, json: bool, lang: Lang) -> Result<String, String> {
     let mut client = guardian_service::ipc::IpcClient::connect(5_000).map_err(|e| {
         format!(
             "could not reach the Workstation Guardian service: {e}\n\
@@ -195,7 +226,7 @@ fn run_online(command: &Command, json: bool) -> Result<String, String> {
         Command::Agents { .. } => Request::GetAgents,
         Command::Network { .. } => Request::GetNetwork,
         Command::Incidents { limit, .. } => Request::GetIncidents { limit: *limit },
-        other => return Err(format!("{other:?} does not require the service")),
+        other => return Err(format!("{other:?} does not require the runtime")),
     };
 
     let response = client.call_expect(&request)?;
@@ -205,7 +236,7 @@ fn run_online(command: &Command, json: bool) -> Result<String, String> {
             .map_err(|e| format!("could not render the response as JSON: {e}"));
     }
 
-    Ok(output::render_response(&response))
+    Ok(output::render_response(&response, lang))
 }
 
 fn main() -> ExitCode {
@@ -225,6 +256,13 @@ fn main() -> ExitCode {
         ..Default::default()
     });
 
+    // The language is taken from `--lang` when given, and from configuration otherwise. Falling
+    // back to `auto` means a user gets their own language without setting anything, while an
+    // operator debugging a machine can still read output in theirs.
+    let lang = flag_value(&args, "--lang")
+        .map(|v| Lang::parse(&v))
+        .unwrap_or_else(configured_language);
+
     let json = command.wants_json();
 
     let result: Result<Option<String>, String> = match &command {
@@ -239,13 +277,12 @@ fn main() -> ExitCode {
         Command::Status { .. }
         | Command::Agents { .. }
         | Command::Network { .. }
-        | Command::Incidents { .. } => run_online(&command, json).map(Some),
-        Command::Update { .. } => doctor::update_report(json).map(Some),
-        Command::Doctor { .. } => doctor::run(json).map(Some),
-        Command::Install { force } => install::install(*force).map(Some),
-        Command::Uninstall { keep_policy } => install::uninstall(*keep_policy).map(Some),
-        Command::Start => install::control_service(install::ServiceAction::Start).map(Some),
-        Command::Stop => install::control_service(install::ServiceAction::Stop).map(Some),
+        | Command::Incidents { .. } => run_online(&command, json, lang).map(Some),
+        Command::Update { .. } => doctor::update_report(json, lang).map(Some),
+        Command::Doctor { .. } => doctor::run(json, lang).map(Some),
+        // The one command that reduces protection. It is named for what it does so it cannot be
+        // mistaken for routine cleanup, and it reports exactly which values it restored.
+        Command::RestorePolicy => install::restore_policy().map(Some),
     };
 
     match result {
@@ -325,19 +362,31 @@ mod tests {
     }
 
     #[test]
-    fn install_and_uninstall_flags_are_recognized() {
+    fn the_restore_policy_command_replaces_the_old_service_commands() {
         assert_eq!(
-            parse_args(&args(&["install", "--force"])).unwrap(),
-            Command::Install { force: true }
+            parse_args(&args(&["restore-policy"])).unwrap(),
+            Command::RestorePolicy
         );
-        assert_eq!(
-            parse_args(&args(&["uninstall", "--keep-policy"])).unwrap(),
-            Command::Uninstall { keep_policy: true }
-        );
-        assert_eq!(
-            parse_args(&args(&["uninstall"])).unwrap(),
-            Command::Uninstall { keep_policy: false }
-        );
+
+        // The service-era commands must now be rejected rather than silently accepted, because
+        // there is no service to install, start or stop. An operator with an old script must be
+        // told, not left believing something happened.
+        for gone in ["install", "uninstall", "start", "stop"] {
+            let err = parse_args(&args(&[gone])).unwrap_err();
+            assert!(
+                err.contains(gone),
+                "'{gone}' must be reported as unknown, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_removed_flags_are_no_longer_accepted() {
+        // `--force` and `--keep-policy` only ever meant anything to install/uninstall.
+        for flag in ["--force", "--keep-policy"] {
+            let err = parse_args(&args(&["restore-policy", flag])).unwrap_err();
+            assert!(err.contains(flag), "flag {flag} must be rejected: {err}");
+        }
     }
 
     #[test]
@@ -365,21 +414,39 @@ mod tests {
     }
 
     #[test]
-    fn service_dependent_commands_are_identified() {
-        assert!(Command::Status { json: false }.needs_service());
-        assert!(Command::Agents { json: false }.needs_service());
-        assert!(Command::Network { json: false }.needs_service());
+    fn runtime_dependent_commands_are_identified() {
+        assert!(Command::Status { json: false }.needs_runtime());
+        assert!(Command::Agents { json: false }.needs_runtime());
+        assert!(Command::Network { json: false }.needs_runtime());
         assert!(Command::Incidents {
             json: false,
             limit: 1
         }
-        .needs_service());
+        .needs_runtime());
 
-        // These must work *without* the service, since that is when they matter most.
-        assert!(!Command::Update { json: false }.needs_service());
-        assert!(!Command::Doctor { json: false }.needs_service());
-        assert!(!Command::Install { force: false }.needs_service());
-        assert!(!Command::Uninstall { keep_policy: false }.needs_service());
+        // These must work *without* the runtime, since that is when they matter most: an operator
+        // diagnosing a machine where Guardian is not running.
+        assert!(!Command::Update { json: false }.needs_runtime());
+        assert!(!Command::Doctor { json: false }.needs_runtime());
+        assert!(!Command::RestorePolicy.needs_runtime());
+    }
+
+    #[test]
+    fn the_lang_flag_is_accepted_with_its_value() {
+        // The value must be consumed so it is not mistaken for an unknown flag.
+        assert_eq!(
+            parse_args(&args(&["status", "--lang", "zh-CN"])).unwrap(),
+            Command::Status { json: false }
+        );
+        assert_eq!(
+            parse_args(&args(&["doctor", "--lang", "en", "--json"])).unwrap(),
+            Command::Doctor { json: true }
+        );
+        assert_eq!(
+            flag_value(&args(&["status", "--lang", "en"]), "--lang").as_deref(),
+            Some("en")
+        );
+        assert_eq!(flag_value(&args(&["status"]), "--lang"), None);
     }
 
     #[test]
@@ -387,7 +454,7 @@ mod tests {
         assert!(Command::Status { json: true }.wants_json());
         assert!(!Command::Status { json: false }.wants_json());
         assert!(Command::Doctor { json: true }.wants_json());
-        assert!(!Command::Install { force: false }.wants_json());
+        assert!(!Command::RestorePolicy.wants_json());
     }
 
     #[test]
@@ -400,10 +467,7 @@ mod tests {
             "update",
             "incidents",
             "doctor",
-            "install",
-            "uninstall",
-            "start",
-            "stop",
+            "restore-policy",
         ] {
             assert!(
                 help.contains(command),
@@ -411,5 +475,24 @@ mod tests {
             );
         }
         assert!(help.contains("--json"));
+        assert!(help.contains("--lang"));
+
+        // The help must not advertise a service that no longer exists. Matching on the command
+        // *line* rather than the whole text, because "restore-policy" contains "install" as a
+        // substring and a naive search would flag it.
+        for gone in ["install", "uninstall", "start", "stop"] {
+            let listed = help.lines().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with(&format!("{gone} "))
+                    || trimmed.starts_with(&format!("{gone}\t"))
+            });
+            assert!(
+                !listed,
+                "the help text still lists the removed '{gone}' command"
+            );
+        }
+        for gone in ["--force", "--keep-policy"] {
+            assert!(!help.contains(gone), "the help still offers '{gone}'");
+        }
     }
 }

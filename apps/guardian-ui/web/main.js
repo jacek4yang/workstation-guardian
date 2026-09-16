@@ -1,16 +1,144 @@
 /*
  * Workstation Guardian control panel.
  *
- * Every value shown here comes from the service, and every action is a request to the service.
- * Nothing in this file decides anything about protection: if this script were deleted, the machine
- * would remain exactly as protected as it is now.
+ * Every value shown here comes from the runtime, and every label is looked up by key. Nothing in
+ * this file decides anything about protection: if this script were deleted, the machine would
+ * remain exactly as protected as it is now.
+ *
+ * The rule the whole project rests on applies here too. A stale "Protected" is the single most
+ * harmful thing this panel could show, so when the panel cannot reach the runtime it says so rather
+ * than leaving the last values on screen.
  */
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
 
 let current = null;
-let refreshTimer = null;
+let currentLang = "en";
+
+/* ------------------------------------------------------------------ strings */
+
+/*
+ * The panel's own vocabulary. Status words ("Protected", "Degraded") are NOT here: those come from
+ * the runtime in the panel document, because the tray, the panel and the CLI must never disagree
+ * about what a state is called.
+ */
+const STRINGS = {
+  en: {
+    title: "Workstation Guardian",
+    connecting: "Starting…",
+    subtitle: (version, when) => `Version ${version} · updated ${when}`,
+    starting: "Starting — protection is being applied",
+    unreachable: "The protection runtime has not reported yet. Protection state is unknown.",
+    protection: "Protection",
+    update_protection: "Update protection",
+    restart_protection: "Restart protection",
+    mode: "Mode",
+    uptime: "Uptime",
+    degraded: "Degraded",
+    pending_reboot: "Pending reboot",
+    update_detail: "Why this verdict",
+    network: "Network",
+    internet: "Internet",
+    pppoe: "PPPoE entry",
+    reconnect: "Reconnect Internet",
+    reconnect_note:
+      "The network guardian dials on its own when the link is down. This only records that you asked for it now.",
+    reconnected: "Reconnect requested.",
+    active_work: "Active work",
+    nothing_detected: "Nothing detected.",
+    agent: "Agent",
+    confidence: "Confidence",
+    sessions: "Sessions",
+    project: "Project",
+    protected_builds: "Protected builds",
+    candidates: "Unconfirmed candidates",
+    candidates_note:
+      "These matched some agent evidence but not enough to be trusted. They are reported for information and never block a shutdown.",
+    incidents: "Incidents",
+    no_incidents: "No incidents recorded.",
+    refresh: "Refresh",
+    hide: "Hide to tray",
+    exit_app: "Exit Guardian",
+    exit_note:
+      'Closing this window hides it to the tray; protection continues. Only "Exit Guardian" stops it.',
+    guarantee_note:
+      "Guardian reduces the risk of an unexpected restart. It cannot make Windows unable to reboot.",
+    not_elevated:
+      "Not running as administrator: the Windows Update policy cannot be applied. Restart Guardian as administrator for full protection.",
+    recovered: "The previous session ended unexpectedly. State was recovered; no work was discarded.",
+    confirm: "Confirm",
+    cancel: "Cancel",
+    confirm_exit_title: "Exit Workstation Guardian?",
+    confirm_exit_body:
+      "This stops protection and removes the tray icon. Windows Update will be unlocked, and a restart could then proceed without Guardian noticing. Reopen Guardian to protect the machine again.",
+    confirm_reconnect_title: "Reconnect now?",
+    confirm_reconnect_body:
+      "The network guardian already reconnects on its own. This asks it to check immediately.",
+    no_policy_values: "No policy values could be read.",
+    unknown_project: "unknown",
+    boot: "Boot",
+  },
+  zh: {
+    title: "Workstation Guardian",
+    connecting: "正在启动…",
+    subtitle: (version, when) => `版本 ${version} · 更新于 ${when}`,
+    starting: "正在启动 — 正在应用保护",
+    unreachable: "保护运行时尚未上报。当前保护状态未知。",
+    protection: "保护",
+    update_protection: "更新保护",
+    restart_protection: "重启保护",
+    mode: "模式",
+    uptime: "运行时长",
+    degraded: "降级组件",
+    pending_reboot: "待重启",
+    update_detail: "判定原因",
+    network: "网络",
+    internet: "互联网",
+    pppoe: "PPPoE 宽带",
+    reconnect: "重新连接网络",
+    reconnect_note: "链路中断时网络守护会自动重拨。此按钮仅表示你希望立即检查。",
+    reconnected: "已请求重连。",
+    active_work: "进行中的工作",
+    nothing_detected: "未检测到。",
+    agent: "Agent",
+    confidence: "置信度",
+    sessions: "会话数",
+    project: "项目",
+    protected_builds: "受保护的构建",
+    candidates: "未确认的候选",
+    candidates_note:
+      "这些进程命中部分特征但证据不足，仅供参考，不会阻止关机。",
+    incidents: "事件记录",
+    no_incidents: "暂无事件记录。",
+    refresh: "刷新",
+    hide: "隐藏到托盘",
+    exit_app: "退出 Guardian",
+    exit_note: "关闭此窗口只会隐藏到托盘，保护将继续。只有“退出 Guardian”才会停止保护。",
+    guarantee_note: "Guardian 可降低意外重启的风险，但无法让 Windows 完全无法重启。",
+    not_elevated:
+      "未以管理员身份运行：无法应用 Windows Update 策略。请以管理员身份重新启动 Guardian 以获得完整保护。",
+    recovered: "上一次会话非正常结束。状态已恢复；未丢弃任何工作。",
+    confirm: "确认",
+    cancel: "取消",
+    confirm_exit_title: "退出 Workstation Guardian？",
+    confirm_exit_body:
+      "这将停止保护并移除托盘图标。Windows Update 将被解锁，此后重启可能在 Guardian 不知情的情况下进行。重新打开 Guardian 可再次保护本机。",
+    confirm_reconnect_title: "立即重连？",
+    confirm_reconnect_body: "网络守护已会自动重连。此操作只是让它立即检查一次。",
+    no_policy_values: "未能读取任何策略值。",
+    unknown_project: "未知",
+    boot: "启动标识",
+  },
+};
+
+/* Look up a string, falling back to English so a missing key can never render as blank. */
+function t(key, ...args) {
+  const table = STRINGS[currentLang] || STRINGS.en;
+  const entry = table[key] !== undefined ? table[key] : STRINGS.en[key];
+  if (entry === undefined) return key;
+  return typeof entry === "function" ? entry(...args) : entry;
+}
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -27,20 +155,29 @@ function clear(node) {
 }
 
 function addItem(list, text, className) {
+  if (!list) return;
   const li = document.createElement("li");
   li.textContent = text;
   if (className) li.className = className;
   list.appendChild(li);
 }
 
-/* Render a protection level, tagging it so the stylesheet can colour it. The text itself is the
-   authority: colour is a convenience. */
-function setLevel(id, level) {
+/* Apply the static translations to the markup. */
+function applyStaticStrings() {
+  for (const node of document.querySelectorAll("[data-i18n]")) {
+    const key = node.dataset.i18n;
+    const value = t(key);
+    if (typeof value === "string") node.textContent = value;
+  }
+  document.documentElement.lang = currentLang === "zh" ? "zh-CN" : "en";
+}
+
+/* Render a protection level. The text is the authority; the class only colours it. */
+function setLevel(id, level, label) {
   const node = el(id);
   if (!node) return;
-  const text = level || "Unknown";
-  node.textContent = text;
-  node.dataset.level = String(text).toLowerCase();
+  node.textContent = label || level || "—";
+  node.dataset.level = String(level || "unknown").toLowerCase();
 }
 
 function formatDuration(ms) {
@@ -56,125 +193,83 @@ function formatDuration(ms) {
 
 function formatTime(ms) {
   if (!ms) return "—";
-  return new Date(ms).toLocaleTimeString();
+  return new Date(ms).toLocaleString();
 }
 
 /* ------------------------------------------------------------------ rendering */
 
-function renderStatus(status) {
-  current = status;
+function renderPanel(payload) {
+  const panel = payload.panel;
+  current = panel;
+  currentLang = panel.lang === "zh-CN" || panel.lang === "zh" ? "zh" : "en";
+  applyStaticStrings();
 
-  setLevel("update-level", status.update.level);
-  setLevel("restart-level", status.restart_protection);
-  el("mode").textContent = status.mode;
-  el("service").textContent = status.service.running
-    ? `Running (${status.service.version})`
-    : "Stopped";
-  el("uptime").textContent = formatDuration(status.service.uptime_ms);
+  // A machine that is not elevated cannot have its policy applied. Saying that plainly is the
+  // difference between an operator fixing it and an operator believing they are covered.
+  const warnings = [];
+  if (!payload.elevated) warnings.push(t("not_elevated"));
+  if (panel.unclean_previous_exit) warnings.push(t("recovered"));
+  const warning = el("warning");
+  if (warnings.length) {
+    warning.textContent = warnings.join(" ");
+    warning.hidden = false;
+  } else {
+    warning.hidden = true;
+  }
 
-  const degraded = status.service.degraded_components || [];
+  setLevel("update-level", panel.update.level, panel.update.label);
+  setLevel("restart-level", panel.restart_protection.level, panel.restart_protection.label);
+  el("mode").textContent = panel.mode.label;
+  el("uptime").textContent = formatDuration(panel.uptime_ms);
+  el("pending").textContent = panel.pending_reboot.label;
+
+  const degraded = panel.degraded_components || [];
   show(el("degraded-row"), degraded.length > 0);
   if (degraded.length) el("degraded").textContent = degraded.join(", ");
 
-  el("pending").textContent = status.pending_reboot.verdict;
+  renderUpdateDetail(panel.update);
+  renderNetwork(panel.network);
+  renderAgents(panel);
 
-  renderUpdateDetail(status.update);
-  renderNetwork(status.network);
-  renderAgents(status.agents);
-  renderMaintenance(status);
-
-  el("subtitle").textContent = `Boot ${status.boot_id} · checked ${formatTime(status.generated_at_ms)}`;
+  el("subtitle").textContent = t("subtitle", panel.version, formatTime(panel.generated_at_ms));
 }
 
 function renderUpdateDetail(update) {
-  const list = el("policy-values");
+  const list = el("update-findings");
   clear(list);
 
-  if (!update.values || update.values.length === 0) {
-    addItem(list, "No policy values could be read.");
+  const findings = update.findings || [];
+  if (findings.length === 0) {
+    // No findings means the policy is exactly as intended. Saying so is better than an empty list,
+    // which reads like a failure to load.
+    addItem(list, `${t("update_protection")}: ${update.label}`);
   } else {
-    for (const v of update.values) {
-      const observed = v.observed === null ? "absent" : describeValue(v.observed);
-      addItem(list, `${v.name}: ${v.matches ? "ok" : "mismatch"} (expected ${describeValue(v.desired)}, found ${observed})`);
-    }
+    for (const f of findings) addItem(list, f, "warn");
   }
 
-  const findings = el("update-findings");
-  clear(findings);
-  for (const f of update.findings || []) {
-    addItem(findings, `${f.message}`, f.severity === "warning" ? "warn" : "");
-  }
-
-  if (update.management && update.management.kind !== "unmanaged") {
-    addItem(findings, "This machine is externally managed, so update policy can be overridden.", "warn");
-  }
-}
-
-function describeValue(value) {
-  if (value === null || value === undefined) return "absent";
-  if (typeof value === "object" && "type" in value) {
-    return `${value.type} ${value.value}`;
-  }
-  return String(value);
+  if (update.backend_error) addItem(list, update.backend_error, "warn");
 }
 
 function renderNetwork(network) {
-  el("internet").textContent = network.internet
-    ? network.internet[0].toUpperCase() + network.internet.slice(1)
-    : "Unknown";
-  el("entry").textContent = network.entry_name || "(not configured)";
-  el("net-uptime").textContent = formatDuration(network.uptime_ms);
-
-  // An ongoing outage is shown with its dial attempts and the last RAS error, because "it is
-  // retrying" and "it has given up because your password changed" need different responses.
-  const outage = network.current_outage;
-  show(el("outage-row"), Boolean(outage));
-  if (outage) {
-    const lastError = (outage.ras_errors || []).slice(-1)[0];
-    el("outage").textContent =
-      `${formatDuration(outage.downtime_ms)} · ${outage.reason} · ${outage.dial_attempts} attempt(s)` +
-      (lastError ? ` · ${lastError.message} (${lastError.code})` : "");
-  }
-
-  const probes = el("probes");
-  clear(probes);
-  if (!network.probes || network.probes.length === 0) {
-    addItem(probes, "No connectivity probes are configured.");
-  } else {
-    for (const p of network.probes) {
-      const detail = p.ok
-        ? `${p.latency_ms ?? "?"}ms`
-        : p.error || "failed";
-      addItem(probes, `${p.id}: ${detail}`, p.ok ? "" : "warn");
-    }
-  }
+  el("internet").textContent = network.internet_label;
+  el("entry").textContent = network.entry_name || "—";
 }
 
-function renderAgents(agents) {
+function renderAgents(panel) {
   const body = el("agents-body");
   clear(body);
 
-  const instances = [];
-  for (const group of agents.agents || []) {
-    for (const inst of group.instances || []) {
-      instances.push(inst);
-    }
-  }
+  const agents = panel.agents || [];
+  show(el("agents-empty"), agents.length === 0);
+  show(el("agents-table"), agents.length > 0);
 
-  show(el("agents-empty"), instances.length === 0);
-  show(el("agents-table"), instances.length > 0);
-
-  for (const inst of instances) {
+  for (const group of agents) {
     const tr = document.createElement("tr");
-    const resumable =
-      inst.resume && inst.resume.kind === "available" ? inst.resume.handle : "—";
-
     for (const text of [
-      inst.display_name,
-      inst.confidence,
-      String(inst.pid),
-      inst.project ? inst.project.name : "unknown",
-      resumable,
+      group.display_name,
+      group.confidence_label,
+      String(group.instance_count),
+      group.project || t("unknown_project"),
     ]) {
       const td = document.createElement("td");
       td.textContent = text;
@@ -182,53 +277,15 @@ function renderAgents(agents) {
     }
     body.appendChild(tr);
   }
-
-  // Protected builds, attributed to their owning agent where known.
-  const list = el("workloads-list");
-  clear(list);
-  const workloads = agents.workloads || [];
-  show(el("workloads"), workloads.length > 0);
-  for (const w of workloads) {
-    const owner = w.owner_kind ? ` under ${w.owner_kind}` : "";
-    addItem(list, `${w.display_name} (pid ${w.pid}, ${formatDuration(w.running_ms)})${owner}`);
-  }
-
-  // Candidates are shown but explicitly labelled as not protected, so nobody believes an
-  // unconfirmed match is being defended.
-  const candidates = el("candidates-list");
-  clear(candidates);
-  const cands = agents.candidates || [];
-  show(el("candidates"), cands.length > 0);
-  for (const c of cands) {
-    const why = (c.evidence || [])[0];
-    addItem(candidates, `${c.name} (pid ${c.pid}) — ${why ? why.detail : "matched some evidence"}`);
-  }
-}
-
-function renderMaintenance(status) {
-  const inMaintenance = String(status.mode).toUpperCase() === "MAINTENANCE";
-  show(el("maintenance-locked"), !inMaintenance);
-  show(el("maintenance-active"), inMaintenance);
-
-  const blockers = status.maintenance_denial_reasons || [];
-  show(el("blockers"), blockers.length > 0);
-  const list = el("blockers-list");
-  clear(list);
-  for (const b of blockers) addItem(list, b);
-
-  el("reboot-auth").textContent = status.reboot_authorization
-    ? `armed until ${formatTime(status.reboot_authorization.expires_at_ms)}`
-    : "none";
 }
 
 async function renderIncidents() {
-  const res = await invoke("get_incidents", { limit: 50 });
   const list = el("incidents-list");
   clear(list);
 
+  const res = await invoke("get_incidents", { limit: 50 });
   if (!res.ok) {
     show(el("incidents-empty"), true);
-    el("incidents-empty").textContent = res.error;
     return;
   }
 
@@ -253,7 +310,6 @@ function setError(message) {
   if (message) {
     banner.textContent = message;
     banner.hidden = false;
-    el("subtitle").textContent = "Service unreachable";
   } else {
     banner.hidden = true;
     banner.textContent = "";
@@ -261,39 +317,34 @@ function setError(message) {
 }
 
 async function refresh() {
-  const res = await invoke("get_status");
+  const res = await invoke("get_panel");
+
   if (res && res.ok) {
     setError(null);
-    renderStatus(res.status);
+    renderPanel(res);
     await renderIncidents();
   } else {
-    // The service is the authority. If it cannot be reached, the panel says so rather than
-    // continuing to show the last snapshot as though it were current - a stale "Protected" would
-    // be the single most harmful thing this UI could display.
-    setError(
-      `Cannot reach the Workstation Guardian service${res && res.error ? `: ${res.error}` : ""}. ` +
-        `Protection state is unknown. Run \`guardianctl doctor\` for details.`
-    );
+    // The runtime is the authority. If it has not reported, the panel says so rather than
+    // continuing to show the last document as though it were current.
+    setError(res && res.message ? res.message : t("unreachable"));
+    if (res) {
+      currentLang = res.lang === "zh-CN" ? "zh" : currentLang;
+      applyStaticStrings();
+    }
   }
 }
 
 /*
- * Ask for confirmation before an action that weakens protection.
+ * Ask for confirmation before an action that stops or weakens protection.
  *
- * `requirePhrase` makes the operator type an exact string. That is deliberately more friction
- * than a second button: the whole design rests on updates being unlocked only by an explicit,
- * deliberate act.
+ * That is deliberately more friction than a second button: the design rests on protection being
+ * stopped only by an explicit, deliberate act.
  */
-function confirmAction({ title, body, phrase }) {
+function confirmAction({ title, body }) {
   return new Promise((resolve) => {
     const dialog = el("confirm-dialog");
     el("confirm-title").textContent = title;
     el("confirm-body").textContent = body;
-    show(el("confirm-phrase-row"), Boolean(phrase));
-    if (phrase) {
-      el("confirm-phrase").textContent = phrase;
-      el("confirm-input").value = "";
-    }
 
     const done = (value) => {
       dialog.close();
@@ -302,79 +353,34 @@ function confirmAction({ title, body, phrase }) {
       resolve(value);
     };
 
-    el("confirm-ok").onclick = () => done(phrase ? el("confirm-input").value : true);
-    el("confirm-cancel").onclick = () => done(null);
+    el("confirm-ok").onclick = () => done(true);
+    el("confirm-cancel").onclick = () => done(false);
     dialog.showModal();
   });
 }
 
-async function enterMaintenance() {
-  const hasBlockers = !el("blockers").hidden;
-  let confirmation = "";
-  let override = false;
-
-  if (hasBlockers) {
-    const answer = await confirmAction({
-      title: "Protected work is running",
-      body:
-        "Entering maintenance mode while agents or builds are running risks losing their work if " +
-        "Windows restarts. Guardian normally refuses this. To override, type the exact phrase below.",
-      phrase: "I understand the risk",
-    });
-    if (answer === null) return;
-    confirmation = answer;
-    override = true;
-  } else {
-    const answer = await confirmAction({
-      title: "Enter maintenance mode?",
-      body:
-        "This unlocks Windows Update so it can install. Guardian will still never authorize an " +
-        "automatic restart on your behalf. You can leave maintenance at any time.",
-    });
-    if (!answer) return;
-  }
-
-  const res = await invoke("enter_maintenance", {
-    overrideProtectedWork: override,
-    confirmation,
-  });
-  if (!res.ok) {
-    setError(res.error);
-  } else {
-    setError(null);
-  }
-  await refresh();
-}
-
-async function exitMaintenance() {
-  const res = await invoke("exit_maintenance");
-  if (!res.ok) setError(res.error);
-  await refresh();
-}
-
-async function armReboot() {
+async function exitApp() {
   const answer = await confirmAction({
-    title: "Authorize one reboot?",
-    body:
-      "This permits exactly one restart to proceed. It expires automatically, cannot be reused, " +
-      "and is discarded on the next boot. Windows Update stays locked throughout.",
+    title: t("confirm_exit_title"),
+    body: t("confirm_exit_body"),
   });
   if (!answer) return;
-
-  const res = await invoke("arm_reboot", { ttlSecs: 1800 });
-  if (!res.ok) setError(res.error);
-  await refresh();
-}
-
-async function disarmReboot() {
-  const res = await invoke("disarm_reboot");
-  if (!res.ok) setError(res.error);
-  await refresh();
+  await invoke("exit_app");
 }
 
 async function reconnect() {
-  const res = await invoke("reconnect", { reason: "requested from the control panel" });
-  if (!res.ok) setError(res.error);
+  const answer = await confirmAction({
+    title: t("confirm_reconnect_title"),
+    body: t("confirm_reconnect_body"),
+  });
+  if (!answer) return;
+
+  const res = await invoke("reconnect");
+  if (res && res.ok) {
+    setError(null);
+  } else if (res) {
+    setError(res.message);
+  }
   await refresh();
 }
 
@@ -383,35 +389,24 @@ async function reconnect() {
 window.addEventListener("DOMContentLoaded", async () => {
   el("refresh").addEventListener("click", refresh);
   el("reconnect").addEventListener("click", reconnect);
-  el("enter-maintenance").addEventListener("click", enterMaintenance);
-  el("exit-maintenance").addEventListener("click", exitMaintenance);
-  el("arm-reboot").addEventListener("click", armReboot);
-  el("disarm-reboot").addEventListener("click", disarmReboot);
-  el("exit-ui").addEventListener("click", async () => {
-    const answer = await confirmAction({
-      title: "Exit the control panel?",
-      body:
-        "This closes the panel only. The guardian service keeps running and your work stays " +
-        "protected. Reopen it from the tray icon.",
-    });
-    if (answer) await invoke("exit_ui");
-  });
+  el("exit-app").addEventListener("click", exitApp);
+  // Hiding is the window manager's job; closing the window already hides it, so this just makes
+  // the behaviour discoverable.
+  el("hide").addEventListener("click", () => window.close());
 
-  // The service pushes on a timer from the Rust side; the panel just re-renders.
-  await listen("guardian://status", (event) => {
+  // The runtime pushes on a timer from the Rust side; the panel only re-renders. There is no
+  // polling timer here, so a hidden panel costs nothing.
+  await listen("guardian://panel", (event) => {
     const payload = event.payload;
     if (payload && payload.ok) {
       setError(null);
-      renderStatus(payload.status);
-    } else if (payload && payload.error) {
-      setError(payload.error);
+      renderPanel(payload);
     }
   });
 
   await refresh();
-  refreshTimer = setInterval(refresh, 10000);
 });
 
 window.addEventListener("beforeunload", () => {
-  if (refreshTimer) clearInterval(refreshTimer);
+  current = null;
 });

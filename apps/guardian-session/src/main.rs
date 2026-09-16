@@ -212,14 +212,21 @@ mod tests {
     }
 
     #[test]
-    fn connecting_without_a_service_fails_cleanly() {
-        // The real service is not running during tests, so this must report rather than hang or
-        // panic. The helper treats this as normal and retries.
-        let result = guardian_service::ipc::IpcClient::connect(200);
+    fn connecting_to_a_nonexistent_runtime_fails_cleanly() {
+        // The helper must treat "Guardian is not running" as normal and retry, not as a crash.
+        //
+        // This cannot assert that nothing is listening: Guardian may well be running on the machine
+        // executing the test, and asserting otherwise would make the suite depend on the machine's
+        // state. What matters is that a connection attempt either succeeds or fails with a message,
+        // quickly and without panicking.
+        let started = std::time::Instant::now();
+        match guardian_service::ipc::IpcClient::connect(200) {
+            Ok(_) => {}
+            Err(e) => assert!(!e.is_empty(), "a failure must be explained"),
+        }
         assert!(
-            result.is_err(),
-            "there should be no service listening on a test machine"
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a connection attempt must not hang"
         );
-        assert!(!result.unwrap_err().is_empty());
     }
 }
