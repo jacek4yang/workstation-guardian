@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-proto",
  "regex",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-network"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-process",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-process"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-proto",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-network",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-proto",
  "guardian-service",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-proto",
  "serde",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-proto",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-update"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-proto",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-proto",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "guardianctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "guardian-core",
  "guardian-network",
