@@ -101,16 +101,23 @@ pub fn enumerate_processes() -> Result<Vec<ProcessSnapshot>, WinError> {
     }
 
     let mut out = Vec::with_capacity(256);
-    let self_pid = current_pid();
 
     while ok {
         let name = crate::wide_array_to_string(&entry.szExeFile);
         let pid = entry.th32ProcessID;
         let parent_pid = entry.th32ParentProcessID;
 
-        // Skip the idle process, which has no image, and ourselves, which we never need to
-        // detect as an agent.
-        if pid != 0 && pid != self_pid {
+        // Skip the idle process, which has no image. Everything else is included, *including this
+        // process*.
+        //
+        // This used to filter out the calling process, on the reasoning that agent detection never
+        // needs to consider Guardian itself. That was wrong, and it was wrong in a way that failed
+        // silently: callers that use this for liveness - the single-instance check, the wait for a
+        // predecessor during an elevated relaunch - could never see their own pid, so "is this
+        // process running?" always answered no for the one process they were asking about. The
+        // exclusion belongs at the call site that wants it, not here, because the one thing an
+        // enumeration must never lie about is whether a process exists.
+        if pid != 0 {
             out.push(build_snapshot(pid, parent_pid, name));
         }
 
@@ -517,14 +524,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enumerate_returns_our_own_processes_and_excludes_self() {
+    fn enumerate_returns_the_whole_process_table() {
         let list = enumerate_processes().expect("enumeration must work without elevation");
         assert!(!list.is_empty(), "a running system has processes");
 
+        // This assertion is the inverse of what it once was, and deliberately so. The enumerator
+        // used to exclude the calling process, which meant every liveness check built on it could
+        // never see its own pid. Callers that want to skip themselves now filter explicitly, where
+        // the intent is visible.
         let self_pid = current_pid();
         assert!(
-            !list.iter().any(|p| p.pid == self_pid),
-            "the enumerator must exclude itself"
+            list.iter().any(|p| p.pid == self_pid),
+            "the enumerator must report the calling process too"
         );
 
         // The test harness is running, so its image should appear somewhere in the tree.
@@ -666,5 +677,27 @@ mod tests {
             user_sid: None,
             cmdline_denied: false,
         }
+    }
+
+    #[test]
+    fn enumeration_includes_this_process() {
+        // Regression. The enumeration used to filter out the calling process, which silently broke
+        // every liveness check built on it: the single-instance guard and the wait-for-predecessor
+        // step of the elevated relaunch could never see the one pid they were asking about. The
+        // symptom was an elevated copy that started, could not tell whether its launcher had exited,
+        // and then fought it for the named pipe until one of them died.
+        //
+        // An enumeration must never lie about whether a process exists, so this is the property
+        // worth pinning.
+        let me = std::process::id();
+        let procs = enumerate_processes().expect("enumeration must succeed");
+        assert!(
+            procs.iter().any(|p| p.pid == me),
+            "the enumeration must include the calling process (pid {me})"
+        );
+        assert!(
+            procs.iter().filter(|p| p.pid == me).count() == 1,
+            "and must report it exactly once"
+        );
     }
 }

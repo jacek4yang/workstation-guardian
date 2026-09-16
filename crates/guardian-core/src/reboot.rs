@@ -375,6 +375,18 @@ pub fn build_unexpected_restart_incident<S: EventLogSource>(
         return None;
     }
 
+    // Same boot means the *process* stopped, not the machine.
+    //
+    // Without this check, restarting Guardian itself - which happens on every elevated relaunch,
+    // and on every update - was reported as "the machine restarted without a clean shutdown ...
+    // N agent(s) and M protected job(s) were lost". Nothing was lost: the boot identity is
+    // unchanged, so the operating system never went anywhere. Reporting a lost-work incident that
+    // did not happen is worse than reporting nothing, because it teaches the operator to ignore
+    // the incidents that matter.
+    if !ctx.previous_boot_id.is_empty() && ctx.previous_boot_id == ctx.current_boot_id {
+        return None;
+    }
+
     let mut events = Vec::new();
     for (channel, query) in evidence_queries(ctx.boot_started_ms, ctx.now_ms) {
         match source.query(channel, &query) {
@@ -609,6 +621,73 @@ mod tests {
         )];
         let r = classify(&src);
         assert_eq!(r.verdict, PendingRebootVerdict::Pending);
+    }
+
+    #[test]
+    fn a_process_restart_on_the_same_boot_is_not_an_unexpected_restart() {
+        // Regression, seen on a real machine: every time Guardian restarted itself - which the
+        // elevated relaunch does by design - it logged
+        //   "the machine restarted without a clean shutdown and the cause could not be determined.
+        //    5 agent(s) and 14 protected job(s) were lost"
+        // while the machine had not restarted at all. The boot identity proves that: it is derived
+        // from the boot time, so an unchanged value means the operating system never went anywhere.
+        //
+        // This matters beyond tidiness. An incident that reports lost work which was not lost
+        // teaches the operator to ignore incidents, and the next one will be real.
+        let ctx = RestartContext {
+            previous_session_clean: false,
+            previous_boot_id: "boot-1789425956000".into(),
+            current_boot_id: "boot-1789425956000".into(),
+            boot_started_ms: 0,
+            now_ms: 100_000,
+            last_heartbeat_ms: Some(90_000),
+            agents_lost: Vec::new(),
+            protected_jobs_lost: 3,
+            last_network_state: None,
+            reboot_was_authorized: false,
+        };
+
+        // No event source is consulted, because the boot comparison decides before any query.
+        let source = NullEventLog;
+        assert!(
+            build_unexpected_restart_incident(&source, &ctx).is_none(),
+            "restarting the program is not the machine restarting"
+        );
+    }
+
+    #[test]
+    fn a_different_boot_id_is_still_an_unexpected_restart() {
+        // The other half: the check must not suppress a genuine restart. A changed boot identity is
+        // exactly the evidence that the machine went down.
+        let ctx = RestartContext {
+            previous_session_clean: false,
+            previous_boot_id: "boot-1".into(),
+            current_boot_id: "boot-2".into(),
+            boot_started_ms: 0,
+            now_ms: 100_000,
+            last_heartbeat_ms: Some(90_000),
+            agents_lost: Vec::new(),
+            protected_jobs_lost: 3,
+            last_network_state: None,
+            reboot_was_authorized: false,
+        };
+
+        let source = NullEventLog;
+        assert!(
+            build_unexpected_restart_incident(&source, &ctx).is_some(),
+            "a changed boot identity must still be reported"
+        );
+    }
+
+    /// An event log that answers every query with nothing.
+    struct NullEventLog;
+
+    impl EventLogSource for NullEventLog {
+        type Error = String;
+
+        fn query(&self, _channel: &str, _query: &EventQuery) -> Result<Vec<EventEvidence>, String> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]

@@ -307,6 +307,13 @@ pub fn run(options: RuntimeOptions, on_ready: impl FnOnce(GuardianRuntime)) {
 
                         let inventory = match guardian_win::process::enumerate_processes() {
                             Ok(procs) => {
+                                // Guardian is not an agent, and detecting itself would be absurd.
+                                // The enumeration now includes this process, so the exclusion is
+                                // made here, where the intent is, rather than in the enumeration
+                                // where it silently broke every liveness check.
+                                let me = std::process::id();
+                                let procs: Vec<_> =
+                                    procs.into_iter().filter(|p| p.pid != me).collect();
                                 let graph = guardian_process::ProcessGraph::new(procs);
                                 let detected = engine.detect_agents(&graph);
                                 let now = guardian_win::clock::unix_now_ms();

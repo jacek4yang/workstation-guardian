@@ -843,13 +843,45 @@ pub fn evaluate(
     }
 
     // --- 3. Decide the outage window ----------------------------------------
+    //
+    // An outage is a loss of *connectivity*, not a link that has not finished being promoted.
+    //
+    // This distinction was wrong, and it produced a permanent false alarm: the window was opened
+    // whenever the link was not yet `Healthy`, but a link that has just dialled correctly sits in
+    // `Verifying` for its whole stabilization window (120 s by default). So every reconnect logged
+    // `outage started` in the same millisecond as `broadband connected`, the panel showed
+    // "Internet: Degraded" for two minutes after a successful reconnect, and the outage record
+    // claimed an outage that never happened.
+    //
+    // The question that matters to a person is "do I have a working path out?", and the answer is
+    // yes when either uplink is up: the broadband session is carrying traffic, or Wi-Fi is. That is
+    // `session_up` plus the Wi-Fi flag, both of which are already tracked.
+    // Note this is deliberately *broadband* connectivity, not "any working path". Wi-Fi continuity
+    // keeping the machine online must not hide a broadband failure that Guardian needs to report
+    // and repair: that is the whole point of running a continuity path rather than treating it as
+    // a substitute.
     let broadband_ok_now = s.broadband == BroadbandState::Healthy;
+    let broadband_session_up = s.broadband.session_up();
+
     if broadband_ok_now {
+        // Fully recovered. Reset the retry schedule; only genuine health resets it.
         s.outage_started_ms = None;
         s.outage_ms = 0;
         s.backoff_index = 0;
         s.dial_attempts = 0;
         s.recent_aborts = s.recent_aborts.saturating_sub(1);
+    } else if broadband_session_up {
+        // The session is up but has not finished being promoted. There is nothing to report as an
+        // outage, and the counters are left alone: a link still being verified must not look like a
+        // fresh outage, and must not reset the backoff either, since it has not proven itself.
+        //
+        // The failure classification is *still recorded*. Clearing it here would lose the reason a
+        // link is unhealthy, and the repair step below reads it to decide whether retrying is worth
+        // doing at all — without it, a rejected password looks like an unknown failure and the dial
+        // loop that check exists to prevent comes right back.
+        s.failure_kind = Some(classify_failure(obs, policy));
+        s.outage_started_ms = None;
+        s.outage_ms = 0;
     } else if s.outage_started_ms.is_none() {
         s.outage_started_ms = Some(now_ms);
         s.failure_kind = s
@@ -1740,6 +1772,59 @@ mod tests {
             !hung_up,
             "a link that has just connected must be given its verification window before any              probe failure can justify tearing it down"
         );
+    }
+
+    #[test]
+    fn a_successful_reconnect_does_not_report_an_outage() {
+        use crate::net::*;
+
+        // Regression, found by watching a real reconnect: the log showed
+        //   "broadband connected; verifying stability before switching back"
+        //   "broadband outage started"
+        // in the same millisecond, and the panel read "Internet: Degraded" for the full two-minute
+        // stabilization window after a reconnect that had actually worked.
+        //
+        // The cause was opening the outage window whenever the link was not yet `Healthy`, which
+        // includes `Verifying` - the state every successful dial passes through. An outage must
+        // mean "no working path", not "not yet promoted".
+        let policy = NetworkPolicy::default();
+
+        let obs = NetworkObservation {
+            ras_connected: true,
+            broadband_has_ip: true,
+            broadband_default_route: true,
+            // Probes still failing: the shape of a filtered network, where the link is fine.
+            probe_results: vec![ProbeOutcome {
+                id: "alidns-tcp".into(),
+                kind: ProbeKind::Tcp,
+                ok: false,
+                latency_ms: None,
+                error: Some("timed out".into()),
+            }],
+            ..Default::default()
+        };
+
+        // The state left by an outage, which is where a reconnect begins.
+        let mut state = NetworkState {
+            broadband: BroadbandState::Reconnecting,
+            ..Default::default()
+        };
+
+        for round in 0..8 {
+            let t = evaluate(&state, &obs, &policy, 1_000 + round * 5_000);
+            assert!(
+                t.state.outage_started_ms.is_none(),
+                "a link that is up must not be reported as an outage (state {:?}, notes {:?})",
+                t.state.broadband,
+                t.notes
+            );
+            assert!(
+                !t.notes.iter().any(|n| n.contains("outage started")),
+                "a successful reconnect must not log an outage: {:?}",
+                t.notes
+            );
+            state = t.state;
+        }
     }
 
     #[test]

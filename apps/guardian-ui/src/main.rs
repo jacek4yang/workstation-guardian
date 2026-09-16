@@ -151,17 +151,27 @@ impl UiBridge {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let relaunched = args.iter().any(|a| a == RELAUNCH_FLAG);
 
-    // The elevated copy is started by the unelevated one, so for a moment both exist. The new
-    // copy announces itself with `--relaunched` and must be allowed through; the old one is the
-    // one that should stand down. Without this handshake the two would race and one would exit at
-    // random — which, if the *elevated* one lost, looks exactly like the button doing nothing.
-    if relaunched {
-        // Wait for the instance that launched us to exit. Bounded: if it is wedged we must not
-        // hang, because the user is looking at a UAC prompt they already approved.
-        wait_for_predecessor(Duration::from_secs(10));
-    } else if let Some(existing) = already_running() {
+    // The elevated copy is started by the unelevated one, so for a moment both exist. The two are
+    // told apart explicitly rather than by guessing:
+    //
+    //   --relaunched=<pid>   this instance was started by <pid>, which is about to exit
+    //
+    // Identifying the predecessor by pid rather than by image name matters. Matching on the name
+    // means "wait for any guardian-ui.exe", which includes this one, and cannot distinguish the
+    // process that is leaving from one that is starting. That made the handshake racy: the new
+    // instance could give up waiting, start alongside its predecessor, and then the two fought over
+    // the named pipe — with the loser exiting, which looks exactly like the button doing nothing.
+    let relaunched_from = args
+        .iter()
+        .find_map(|a| a.strip_prefix(RELAUNCH_PREFIX))
+        .and_then(|v| v.parse::<u32>().ok());
+
+    if let Some(predecessor) = relaunched_from {
+        // Wait for the specific process that launched us. Bounded, because the user has already
+        // approved the UAC prompt and is waiting for a window.
+        wait_for_exit(predecessor, Duration::from_secs(15));
+    } else if let Some(existing) = other_instance() {
         eprintln!(
             "Workstation Guardian is already running (pid {existing}). \
              Use the tray icon to open it."
@@ -174,23 +184,36 @@ fn main() {
         .expect("the Tauri runtime could not start");
 }
 
-/// The flag the elevated instance is started with.
-const RELAUNCH_FLAG: &str = "--relaunched";
+/// The prefix the elevated instance is started with, followed by the launcher's pid.
+const RELAUNCH_PREFIX: &str = "--relaunched=";
 
-/// Wait for any other copy of this program to exit.
+/// Wait for one specific process to exit.
 ///
-/// Returns as soon as none is left, or when `timeout` elapses. A timeout is not an error: two
-/// copies coexisting briefly is survivable (the pipe server tolerates it and the journal is
-/// locked), whereas refusing to start would strand the user with only the unelevated copy.
-fn wait_for_predecessor(timeout: Duration) {
+/// Returns as soon as that pid is gone. A timeout is not an error: coexisting briefly is
+/// survivable, whereas refusing to start would strand the user with only the unelevated copy.
+fn wait_for_exit(pid: u32, timeout: Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if other_instance().is_none() {
+        if !process_alive(pid) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
-    tracing::warn!("an earlier copy did not exit; continuing anyway");
+    tracing::warn!(
+        pid,
+        "the instance that launched us did not exit; continuing anyway"
+    );
+}
+
+/// Whether a pid is still running.
+///
+/// Enumerating and matching is used rather than `OpenProcess`, because the predecessor runs at a
+/// different integrity level and a direct query can fail for permission reasons that would look
+/// like "already exited".
+fn process_alive(pid: u32) -> bool {
+    guardian_win::process::enumerate_processes()
+        .map(|procs| procs.iter().any(|p| p.pid == pid))
+        .unwrap_or(false)
 }
 
 /// Another copy of this program, by pid.
@@ -205,14 +228,6 @@ fn other_instance() -> Option<u32> {
             name == "guardian-ui.exe" || name == "guardian.exe"
         })
         .map(|p| p.pid)
-}
-
-/// Whether another copy of this program is already running, and its pid.
-///
-/// Compares by image name rather than by a lock file. A lock file left behind by a crash would
-/// permanently block startup; a running process is self-evidently current.
-fn already_running() -> Option<u32> {
-    other_instance()
 }
 
 /// The language to render in, from configuration, defaulting to the system locale.
@@ -748,7 +763,10 @@ fn restart_elevated(
         });
     }
 
-    match guardian_win::elevation::relaunch_elevated_with(&[RELAUNCH_FLAG]) {
+    // Pass this process's pid so the new instance waits for *this* one, not for any process that
+    // happens to share the image name.
+    let flag = format!("{RELAUNCH_PREFIX}{}", std::process::id());
+    match guardian_win::elevation::relaunch_elevated_with(&[&flag]) {
         Ok(true) => {
             // The new instance is on its way. Stop this one so it can take over cleanly.
             let handle = app.clone();
@@ -958,12 +976,32 @@ mod tests {
     }
 
     #[test]
-    fn the_relaunch_flag_is_not_mistaken_for_a_normal_start() {
-        // The elevated instance is started with the flag; without it the single-instance check
-        // would turn its own restart away and the user would see the button do nothing.
-        assert_eq!(RELAUNCH_FLAG, "--relaunched");
-        let parsed: Vec<String> = [RELAUNCH_FLAG].iter().map(|s| s.to_string()).collect();
-        assert!(parsed.iter().any(|a| a == RELAUNCH_FLAG));
+    fn the_relaunch_flag_carries_the_launcher_pid() {
+        // The pid is what makes the handshake unambiguous. With a bare flag the new instance has to
+        // guess which process to wait for by image name, which also matches *itself*, so it cannot
+        // reliably tell a process that is leaving from one that is starting.
+        let pid = 4242u32;
+        let flag = format!("{RELAUNCH_PREFIX}{pid}");
+        assert_eq!(flag, "--relaunched=4242");
+
+        let parsed = flag
+            .strip_prefix(RELAUNCH_PREFIX)
+            .and_then(|v| v.parse::<u32>().ok());
+        assert_eq!(parsed, Some(pid));
+    }
+
+    #[test]
+    fn a_normal_start_has_no_predecessor() {
+        // Without the flag nothing is stripped, so the single-instance check applies as usual.
+        assert_eq!("--turbo".strip_prefix(RELAUNCH_PREFIX), None);
+        assert_eq!("--relaunched".strip_prefix(RELAUNCH_PREFIX), None);
+        // A malformed pid must not be treated as a predecessor to wait for.
+        assert_eq!(
+            "--relaunched=abc"
+                .strip_prefix(RELAUNCH_PREFIX)
+                .and_then(|v| v.parse::<u32>().ok()),
+            None
+        );
     }
 
     #[test]
@@ -971,11 +1009,22 @@ mod tests {
         // A wedged earlier copy must not hang the new one: the user has already approved the UAC
         // prompt and is waiting for a window to appear.
         let start = std::time::Instant::now();
-        // With no other instance running this returns immediately.
-        wait_for_predecessor(Duration::from_millis(500));
+        // A pid that cannot exist, so the wait returns once the timeout elapses.
+        wait_for_exit(0xFFFF_FFFE, Duration::from_millis(300));
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "waiting for a predecessor must be bounded"
+        );
+    }
+
+    #[test]
+    fn this_process_is_reported_as_alive() {
+        // `process_alive` guards the wait, so a false negative here would make the new instance
+        // start alongside its predecessor and fight it for the pipe.
+        assert!(process_alive(std::process::id()));
+        assert!(
+            !process_alive(0xFFFF_FFFE),
+            "a nonexistent pid is not alive"
         );
     }
 
